@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>tictactoe_robot</name>
+  <version>0.0.0</version>
+  <description>TicTacToe robot package</description>
+
+  <maintainer email="victor.gil.ferrer@gmail.com">victor</maintainer>
+  <license>TODO: License declaration</license>
+
+  <!-- Build tool -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- Dependencias principales -->
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+
+  <!-- TU paquete de interfaces -->
+  <depend>tictactoe_interfaces</depend>
+
+  <!-- (Opcional pero común) -->
+  <exec_depend>python3</exec_depend>
+
+  <!-- Testing -->
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

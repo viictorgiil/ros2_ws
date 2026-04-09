@@ -1,0 +1,17 @@
+# tictactoe_interfaces/srv/PlacePiece.srv
+#
+# Request: tell the robot which piece to place and where.
+# Response: success flag + human-readable message.
+#
+# Génerate with:
+#   colcon build --packages-select tictactoe_interfaces
+#
+# ---
+
+string  symbol        # 'X' or 'O'
+int32   cell_index    # board position 0-8
+
+---
+
+bool    success
+string  message
