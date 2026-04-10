@@ -265,6 +265,7 @@ class RobotController(Node):
         )
 
         self._publish_status("BUSY")
+
         # 1. HOME
         self._move_to(home_joints, "home")
 
