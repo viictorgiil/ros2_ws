@@ -1,5 +1,11 @@
 """
-game_node.py  ─  versión PyQt6
+game_node.py  ─  versión PyQt6 actualizada
+──────────────────────────────────────────
+Cambios respecto a la versión original:
+  • Usa launch_app() de main_window en lugar de construir MainWindow directamente.
+  • RosSignalBridge.move_completed ahora lleva solo cell_index (sin cambio en firma),
+    pero MainWindow._on_move_completed() infiere el símbolo desde el estado del tablero.
+  • La señal de turno humano se gestiona vía robot_status_changed → IDLE.
 """
 
 import sys
@@ -15,20 +21,16 @@ from tictactoe_robot.tictactoe_game import TicTacToe
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from tictactoe_robot.gui.main_window import MainWindow
+from tictactoe_robot.gui.main_window import launch_app
 
 PLACE_PIECE_SERVICE = "/robot_controller/place_piece"
 
 
 class RosSignalBridge(QObject):
-    """
-    Objeto Qt puro que emite señales desde callbacks de ROS.
-    Necesario para cruzar el puente entre hilos de forma segura.
-    """
-    robot_status_changed = pyqtSignal(str)   # "IDLE" / "BUSY" / "MOVING: home"
-    move_completed       = pyqtSignal(int)   # cell_index que acaba de jugar el robot
+    robot_status_changed = pyqtSignal(str)   # "IDLE" / "BUSY" / "MOVING: …"
+    move_completed       = pyqtSignal(int)   # cell_index completado
     game_over            = pyqtSignal(str)   # "X" / "O" / "TIE"
-    ai_thinking          = pyqtSignal(int)   # cell que ha elegido minimax
+    ai_thinking          = pyqtSignal(int)   # celda elegida por minimax
 
 
 class GameNode(Node):
@@ -37,7 +39,7 @@ class GameNode(Node):
         super().__init__("game_node")
         self._bridge = bridge
         self._game   = TicTacToe()
-        self._robot_idle = True
+        self._robot_idle   = True
         self._game_started = False
 
         cbg = MutuallyExclusiveCallbackGroup()
@@ -55,13 +57,14 @@ class GameNode(Node):
 
         ready = self._place_client.wait_for_service(timeout_sec=5.0)
         if not ready:
-            self.get_logger().warning("robot_controller no disponible — modo simulación.")
+            self.get_logger().warning(
+                "robot_controller no disponible — modo simulación."
+            )
 
-    # ── llamado desde la GUI cuando el usuario configura el juego ──────
+    # ── API pública (llamada desde MainWindow) ─────────────────────────
 
     def start_game(self, human_symbol: str, difficulty: float):
-        """La GUI llama a esto cuando el usuario pulsa 'Start'."""
-        self._game             = TicTacToe()
+        self._game              = TicTacToe()
         self._game.random_prob  = difficulty
         self._game.human_player = human_symbol
         self._game.ai_player    = "O" if human_symbol == "X" else "X"
@@ -71,39 +74,49 @@ class GameNode(Node):
         self._ai_turn = random.choice([True, False])
 
         if self._ai_turn:
+            # Robot empieza: deshabilitar tablero hasta que termine
+            self._bridge.robot_status_changed.emit("BUSY")
             threading.Thread(target=self._do_ai_turn, daemon=True).start()
-
-    # ── llamado desde la GUI cuando el humano clica una celda ──────────
+        else:
+            # Humano empieza: emitir IDLE para que BoardWidget habilite turno
+            self._bridge.robot_status_changed.emit("IDLE")
 
     def human_move(self, cell_index: int):
-        """La GUI llama a esto cuando el humano clica una celda válida."""
+        """BoardWidget llama a esto tras confirmar la jugada."""
         if not self._game_started or self._ai_turn:
             return
         if self._game.board[cell_index] != " ":
             return
 
         self._game.make_move(cell_index, self._game.human_player)
+        # Notificar movimiento completado del humano
         self._bridge.move_completed.emit(cell_index)
 
         if self._check_game_over():
             return
 
         self._ai_turn = True
+        self._bridge.robot_status_changed.emit("BUSY")
         threading.Thread(target=self._do_ai_turn, daemon=True).start()
 
-    # ── lógica interna ──────────────────────────────────────────────────
+    # ── lógica interna ─────────────────────────────────────────────────
 
     def _do_ai_turn(self):
         move = self._game.get_best_move()
         self._bridge.ai_thinking.emit(move)
 
+        # Mover físicamente — bloquea hasta que el robot termina
         self._call_place_piece(self._game.ai_player, move)
 
         self._game.make_move(move, self._game.ai_player)
+
+        # Emitir move_completed DESPUÉS de que el movimiento físico ha acabado
         self._bridge.move_completed.emit(move)
 
         if not self._check_game_over():
             self._ai_turn = False
+            # IDLE hace que BoardWidget habilite el turno humano
+            self._bridge.robot_status_changed.emit("IDLE")
 
     def _check_game_over(self) -> bool:
         if not self._game.game_over():
@@ -116,15 +129,15 @@ class GameNode(Node):
 
     def _call_place_piece(self, symbol: str, cell_index: int) -> bool:
         if not self._place_client.service_is_ready():
-            import time; time.sleep(1.5)   # simula tiempo de movimiento
+            import time; time.sleep(1.5)
             return True
 
         req = PlacePiece.Request()
         req.symbol     = symbol
         req.cell_index = cell_index
 
-        import threading, time
-        done = threading.Event()
+        import time
+        done     = threading.Event()
         response = None
 
         def cb(fut):
@@ -138,6 +151,7 @@ class GameNode(Node):
         if not response.success:
             return False
 
+        # Esperar a que el robot informe IDLE
         self._robot_idle = False
         while not self._robot_idle:
             time.sleep(0.1)
@@ -148,7 +162,7 @@ class GameNode(Node):
         self._bridge.robot_status_changed.emit(msg.data)
 
 
-# ───────────────────────────────────────────────────── main
+# ──────────────────────────────────────────────────────────────── main
 
 def main(args=None):
     rclpy.init(args=args)
@@ -163,8 +177,13 @@ def main(args=None):
     )
     ros_thread.start()
 
-    window = MainWindow(bridge, node)
-    window.show()
+    # 1. Muestra SetupDialog; si se acepta, abre MainWindow y arranca partida
+    window = launch_app(bridge, node)
+    if window is None:
+        # Usuario cerró el diálogo sin iniciar
+        node.destroy_node()
+        rclpy.shutdown()
+        sys.exit(0)
 
     exit_code = app.exec()
 
