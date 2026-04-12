@@ -1,0 +1,21 @@
+# tictactoe_interfaces/action/PlacePiece.action
+#
+# Goal   → qué pieza poner y dónde
+# Result → si se completó con éxito
+# Feedback → progreso del movimiento (waypoint actual)
+
+# ── Goal ─────────────────────────────────────────────
+string symbol        # "X" o "O"
+int32  cell_index    # 0-8
+
+---
+
+# ── Result ───────────────────────────────────────────
+bool   success
+string message       # descripción del resultado o error
+
+---
+
+# ── Feedback ─────────────────────────────────────────
+string phase         # "approach_stock" | "pick" | "approach_cell" | "place" | "return_home"
+int32  waypoint      # índice del waypoint actual dentro de la fase

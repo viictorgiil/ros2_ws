@@ -133,7 +133,7 @@ class SetupDialog(QDialog):
     start_requested = pyqtSignal(str, float, bool)
 
     _DIFFICULTIES = {
-        "Easy":   0.25,
+        "Easy":   0.75,
         "Medium": 0.50,
         "Hard":   0.0,
     }
@@ -239,7 +239,7 @@ class SetupDialog(QDialog):
         self._diff_group.setExclusive(True)
 
         configs = [
-            ("Easy",   "25% random moves",   _ACCENT_TEAL),
+            ("Easy",   "75% random moves",   _ACCENT_TEAL),
             ("Medium", "50% random moves",   _ACCENT_BLUE),
             ("Hard",   "perfect Minimax AI", _ACCENT_PINK),
         ]

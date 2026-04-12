@@ -11,6 +11,7 @@ find_package(rosidl_default_generators REQUIRED)
 # 👇 GENERACIÓN DE INTERFACES (ANTES de ament_package)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlacePiece.srv"
+  "action/PlacePiece.action"
 )
 
 if(BUILD_TESTING)
