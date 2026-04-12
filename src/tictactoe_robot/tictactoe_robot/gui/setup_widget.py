@@ -5,7 +5,14 @@ Ventana de configuración inicial del juego.
 Se muestra sola al arrancar; al pulsar Start se cierra y abre MainWindow.
 
 Señal emitida:
-    start_requested(symbol: str, difficulty: float)
+    start_requested(symbol: str, difficulty: float, teleop: bool)
+
+Modos:
+  • Normal   → IA decide y robot mueve solo en su turno.
+  • Teleop   → el robot ejecuta TODAS las piezas (humano + IA).
+               La sección de dificultad se oculta (la IA sigue jugando
+               internamente para saber dónde va la pieza del robot, pero
+               en teleop la dificultad no tiene sentido exponer).
 """
 
 from PyQt6.QtWidgets import (
@@ -19,16 +26,17 @@ from PyQt6.QtGui  import QFont
 
 # ─────────────────────────────────────────────────── paleta / constantes
 
-_BG          = "#11111b"
-_SURFACE     = "#1e1e2e"
-_SURFACE2    = "#181825"
-_BORDER      = "#313244"
-_ACCENT_BLUE = "#89b4fa"
-_ACCENT_PINK = "#f38ba8"
-_ACCENT_TEAL = "#94e2d5"
-_TEXT        = "#cdd6f4"
-_SUBTEXT     = "#6c7086"
-_GREEN       = "#a6e3a1"
+_BG           = "#11111b"
+_SURFACE      = "#1e1e2e"
+_SURFACE2     = "#181825"
+_BORDER       = "#313244"
+_ACCENT_BLUE  = "#89b4fa"
+_ACCENT_PINK  = "#f38ba8"
+_ACCENT_TEAL  = "#94e2d5"
+_ACCENT_PEACH = "#fab387"   # naranja — modo teleop
+_TEXT         = "#cdd6f4"
+_SUBTEXT      = "#6c7086"
+_GREEN        = "#a6e3a1"
 
 _FONT_TITLE  = QFont("JetBrains Mono", 13, QFont.Weight.Bold)
 _FONT_LABEL  = QFont("JetBrains Mono", 9)
@@ -121,7 +129,8 @@ class SetupDialog(QDialog):
     Acepta → emite start_requested y se cierra.
     """
 
-    start_requested = pyqtSignal(str, float)
+    # symbol, difficulty, teleop
+    start_requested = pyqtSignal(str, float, bool)
 
     _DIFFICULTIES = {
         "Easy":   0.25,
@@ -133,11 +142,12 @@ class SetupDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("TicTacToe × UR3 — Configuración")
         self.setModal(True)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(540)
         self.setStyleSheet(f"background: {_BG};")
 
         self._symbol     : str   = "X"
         self._difficulty : float = 0.0
+        self._teleop     : bool  = False
 
         self._build_ui()
 
@@ -161,7 +171,46 @@ class SetupDialog(QDialog):
         subtitle.setStyleSheet(f"color: {_SUBTEXT};")
         root.addWidget(subtitle)
 
-        # Símbolo
+        # ── Modo de operación ───────────────────────────────────────────
+        mode_card = SectionCard("// MODE")
+        mode_row  = QHBoxLayout()
+        mode_row.setSpacing(12)
+
+        self._btn_normal = ToggleButton(
+            "🤖  Normal",
+            "AI moves its own pieces",
+            _ACCENT_BLUE,
+        )
+        self._btn_teleop = ToggleButton(
+            "🕹️  Teleop",
+            "robot moves all pieces",
+            _ACCENT_PEACH,
+        )
+
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_group.addButton(self._btn_normal)
+        self._mode_group.addButton(self._btn_teleop)
+        self._btn_normal.setChecked(True)
+
+        mode_row.addWidget(self._btn_normal)
+        mode_row.addWidget(self._btn_teleop)
+        mode_card.inner.addLayout(mode_row)
+
+        # Nota explicativa del modo teleop
+        self._teleop_note = QLabel(
+            "⚠  En modo teleop el robot ejecuta físicamente TODAS las piezas —\n"
+            "    las tuyas y las suyas. Tú decides en el tablero; el brazo actúa."
+        )
+        self._teleop_note.setFont(_FONT_SMALL)
+        self._teleop_note.setStyleSheet(
+            f"color: {_ACCENT_PEACH}; border: none; padding-top: 4px;"
+        )
+        self._teleop_note.setVisible(False)
+        mode_card.inner.addWidget(self._teleop_note)
+        root.addWidget(mode_card)
+
+        # ── Símbolo ─────────────────────────────────────────────────────
         sym_card = SectionCard("// CHOOSE YOUR SYMBOL")
         sym_row  = QHBoxLayout()
         sym_row.setSpacing(12)
@@ -180,9 +229,9 @@ class SetupDialog(QDialog):
         sym_card.inner.addLayout(sym_row)
         root.addWidget(sym_card)
 
-        # Dificultad
-        diff_card = SectionCard("// DIFFICULTY")
-        diff_row  = QHBoxLayout()
+        # ── Dificultad (oculta en teleop) ────────────────────────────────
+        self._diff_card = SectionCard("// DIFFICULTY")
+        diff_row        = QHBoxLayout()
         diff_row.setSpacing(12)
 
         self._diff_btns: dict[str, ToggleButton] = {}
@@ -201,17 +250,17 @@ class SetupDialog(QDialog):
             diff_row.addWidget(btn)
 
         self._diff_btns["Hard"].setChecked(True)
-        diff_card.inner.addLayout(diff_row)
-        root.addWidget(diff_card)
+        self._diff_card.inner.addLayout(diff_row)
+        root.addWidget(self._diff_card)
 
-        # Info dinámica
+        # ── Info dinámica ────────────────────────────────────────────────
         self._info_lbl = QLabel(self._info_text())
         self._info_lbl.setFont(_FONT_SMALL)
         self._info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._info_lbl.setStyleSheet(f"color: {_SUBTEXT};")
         root.addWidget(self._info_lbl)
 
-        # Botón Start
+        # ── Botón Start ──────────────────────────────────────────────────
         self._start_btn = QPushButton("▶  START GAME")
         self._start_btn.setFont(QFont("JetBrains Mono", 12, QFont.Weight.Bold))
         self._start_btn.setMinimumHeight(52)
@@ -229,7 +278,9 @@ class SetupDialog(QDialog):
         """)
         root.addWidget(self._start_btn)
 
-        # Conexiones
+        # ── Conexiones ───────────────────────────────────────────────────
+        self._btn_normal.toggled.connect(self._on_mode_changed)
+        self._btn_teleop.toggled.connect(self._on_mode_changed)
         self._btn_x.toggled.connect(self._on_symbol_changed)
         self._btn_o.toggled.connect(self._on_symbol_changed)
         for btn in self._diff_btns.values():
@@ -237,6 +288,12 @@ class SetupDialog(QDialog):
         self._start_btn.clicked.connect(self._on_start_clicked)
 
     # ──────────────────────────────────────────────── slots
+
+    def _on_mode_changed(self):
+        self._teleop = self._btn_teleop.isChecked()
+        self._teleop_note.setVisible(self._teleop)
+        self.adjustSize()
+        self._info_lbl.setText(self._info_text())
 
     def _on_symbol_changed(self):
         self._symbol = "X" if self._btn_x.isChecked() else "O"
@@ -250,18 +307,19 @@ class SetupDialog(QDialog):
         self._info_lbl.setText(self._info_text())
 
     def _on_start_clicked(self):
-        self.start_requested.emit(self._symbol, self._difficulty)
-        self.accept()   # cierra el diálogo → main_window se abre
+        self.start_requested.emit(self._symbol, self._difficulty, self._teleop)
+        self.accept()
 
     # ──────────────────────────────────────────────── helpers
 
     def _info_text(self) -> str:
+        ai_sym = "O" if self._symbol == "X" else "X"
         diff_name = next(
             (k for k, v in self._DIFFICULTIES.items() if v == self._difficulty),
             "Hard",
         )
-        ai_sym = "O" if self._symbol == "X" else "X"
+        mode_str = "TELEOP" if self._teleop else "Normal"
         return (
             f"You: '{self._symbol}'  │  Robot AI: '{ai_sym}'  │  "
-            f"Difficulty: {diff_name}"
+            f"Difficulty: {diff_name}  │  Mode: {mode_str}"
         )

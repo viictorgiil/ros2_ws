@@ -1,11 +1,11 @@
 """
 game_node.py  ─  versión PyQt6 actualizada
 ──────────────────────────────────────────
-Cambios respecto a la versión original:
-  • Usa launch_app() de main_window en lugar de construir MainWindow directamente.
-  • RosSignalBridge.move_completed ahora lleva solo cell_index (sin cambio en firma),
-    pero MainWindow._on_move_completed() infiere el símbolo desde el estado del tablero.
-  • La señal de turno humano se gestiona vía robot_status_changed → IDLE.
+Modos:
+  • Normal  → IA decide y robot mueve solo en su turno.
+  • Teleop  → robot ejecuta TODAS las piezas (humano + IA).
+              En human_move() se llama primero a _call_place_piece()
+              con el símbolo humano antes de pasar el turno a la IA.
 """
 
 import sys
@@ -31,6 +31,8 @@ class RosSignalBridge(QObject):
     move_completed       = pyqtSignal(int)   # cell_index completado
     game_over            = pyqtSignal(str)   # "X" / "O" / "TIE"
     ai_thinking          = pyqtSignal(int)   # celda elegida por minimax
+    human_turn_started   = pyqtSignal()      # turno del humano listo (explícito)
+    robot_placing_human  = pyqtSignal()      # teleop: robot ejecutando pieza humana
 
 
 class GameNode(Node):
@@ -41,6 +43,7 @@ class GameNode(Node):
         self._game   = TicTacToe()
         self._robot_idle   = True
         self._game_started = False
+        self._teleop       = False   # se fija en start_game()
 
         cbg = MutuallyExclusiveCallbackGroup()
 
@@ -63,23 +66,23 @@ class GameNode(Node):
 
     # ── API pública (llamada desde MainWindow) ─────────────────────────
 
-    def start_game(self, human_symbol: str, difficulty: float):
+    def start_game(self, human_symbol: str, difficulty: float, teleop: bool = False):
         self._game              = TicTacToe()
         self._game.random_prob  = difficulty
         self._game.human_player = human_symbol
         self._game.ai_player    = "O" if human_symbol == "X" else "X"
         self._game_started      = True
+        self._teleop            = teleop
 
         import random
         self._ai_turn = random.choice([True, False])
 
         if self._ai_turn:
-            # Robot empieza: deshabilitar tablero hasta que termine
             self._bridge.robot_status_changed.emit("BUSY")
             threading.Thread(target=self._do_ai_turn, daemon=True).start()
         else:
-            # Humano empieza: emitir IDLE para que BoardWidget habilite turno
             self._bridge.robot_status_changed.emit("IDLE")
+            self._bridge.human_turn_started.emit()
 
     def human_move(self, cell_index: int):
         """BoardWidget llama a esto tras confirmar la jugada."""
@@ -88,35 +91,64 @@ class GameNode(Node):
         if self._game.board[cell_index] != " ":
             return
 
+        if self._teleop:
+            # Teleop: el robot ejecuta físicamente la pieza del humano primero
+            threading.Thread(
+                target=self._do_human_teleop_move,
+                args=(cell_index,),
+                daemon=True,
+            ).start()
+        else:
+            # Normal: registrar jugada y pasar turno a la IA
+            self._game.make_move(cell_index, self._game.human_player)
+            self._bridge.move_completed.emit(cell_index)
+
+            if self._check_game_over():
+                return
+
+            self._ai_turn = True
+            self._bridge.robot_status_changed.emit("BUSY")
+            threading.Thread(target=self._do_ai_turn, daemon=True).start()
+
+    # ── lógica interna ─────────────────────────────────────────────────
+
+    def _do_human_teleop_move(self, cell_index: int):
+        """
+        Modo teleop: el robot ejecuta la pieza del humano.
+        Emite robot_placing_human para que la UI muestre el mensaje correcto.
+        """
+        self._bridge.robot_status_changed.emit("BUSY")
+        self._bridge.robot_placing_human.emit()
+
+        self._call_place_piece(self._game.human_player, cell_index)
+
         self._game.make_move(cell_index, self._game.human_player)
-        # Notificar movimiento completado del humano
+        # Dibujar pieza del humano ANTES de habilitar turno IA
         self._bridge.move_completed.emit(cell_index)
 
         if self._check_game_over():
             return
 
+        # Turno de la IA — sin volver al turno humano entre medias
         self._ai_turn = True
-        self._bridge.robot_status_changed.emit("BUSY")
-        threading.Thread(target=self._do_ai_turn, daemon=True).start()
-
-    # ── lógica interna ─────────────────────────────────────────────────
+        self._do_ai_turn()
 
     def _do_ai_turn(self):
         move = self._game.get_best_move()
         self._bridge.ai_thinking.emit(move)
 
-        # Mover físicamente — bloquea hasta que el robot termina
         self._call_place_piece(self._game.ai_player, move)
 
         self._game.make_move(move, self._game.ai_player)
 
-        # Emitir move_completed DESPUÉS de que el movimiento físico ha acabado
+        # Dibujar pieza del robot ANTES de cambiar el estado de turno
         self._bridge.move_completed.emit(move)
 
         if not self._check_game_over():
             self._ai_turn = False
-            # IDLE hace que BoardWidget habilite el turno humano
             self._bridge.robot_status_changed.emit("IDLE")
+            # Señal explícita: el turno del humano empieza ahora
+            self._bridge.human_turn_started.emit()
 
     def _check_game_over(self) -> bool:
         if not self._game.game_over():

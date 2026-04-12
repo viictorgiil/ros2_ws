@@ -81,14 +81,16 @@ class MainWindow(QMainWindow):
         bridge.robot_status_changed.connect(self._board.on_status_changed)
         bridge.game_over.connect(self._board.on_game_over)
         bridge.ai_thinking.connect(self._board.on_ai_thinking)
+        bridge.human_turn_started.connect(self._board.on_human_turn_started)
+        bridge.robot_placing_human.connect(self._board.on_robot_placing_human)
 
         # Confirmar jugada humana → GameNode
         self._board.move_confirmed.connect(node.human_move)
 
     # ──────────────────────────────────────────────── API pública
 
-    def start_new_game(self, symbol: str, difficulty: float):
-        """Llamado desde game_node.main() tras cerrar el SetupDialog."""
+    def start_new_game(self, symbol: str, difficulty: float, teleop: bool = False):
+        """Llamado desde launch_app() tras cerrar el SetupDialog."""
         self._human_symbol = symbol
         self._ai_symbol    = "O" if symbol == "X" else "X"
 
@@ -96,7 +98,7 @@ class MainWindow(QMainWindow):
             human_symbol=self._human_symbol,
             ai_symbol=self._ai_symbol,
         )
-        self._node.start_game(symbol, difficulty)
+        self._node.start_game(symbol, difficulty, teleop)
 
         # Si el nodo decide que el AI empieza, deshabilitar tablero;
         # si empieza el humano, enable_human_turn() se llamará desde
@@ -145,19 +147,21 @@ def launch_app(bridge, node):
 
     result_symbol     : str   = "X"
     result_difficulty : float = 0.0
+    result_teleop     : bool  = False
 
-    def _capture(symbol: str, difficulty: float):
-        nonlocal result_symbol, result_difficulty
+    def _capture(symbol: str, difficulty: float, teleop: bool):
+        nonlocal result_symbol, result_difficulty, result_teleop
         result_symbol     = symbol
         result_difficulty = difficulty
+        result_teleop     = teleop
 
     setup.start_requested.connect(_capture)
-    accepted = setup.exec()   # bloqueante hasta que el usuario pulsa Start o cierra
+    accepted = setup.exec()
 
     if not accepted:
         return None
 
     window = MainWindow(bridge, node)
     window.show()
-    window.start_new_game(result_symbol, result_difficulty)
+    window.start_new_game(result_symbol, result_difficulty, result_teleop)
     return window

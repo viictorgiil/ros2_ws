@@ -367,10 +367,18 @@ class BoardWidget(QWidget):
 
     # Llamado desde bridge.robot_status_changed
     def on_status_changed(self, status: str):
+        """Actualiza el indicador de estado del robot. NO gestiona el turno."""
         self._status_bar.set_robot_status(status)
-        if status.upper() == "IDLE" and not self._human_turn:
-            # el robot ha terminado → turno humano
-            self.enable_human_turn()
+
+    # Llamado desde bridge.human_turn_started (señal explícita)
+    def on_human_turn_started(self):
+        """El robot ha terminado: habilitar turno del humano."""
+        self.enable_human_turn()
+
+    # Llamado desde bridge.robot_placing_human (solo teleop)
+    def on_robot_placing_human(self):
+        """Teleop: el robot está colocando la pieza del humano."""
+        self._status_bar.set_turn("🦾 Robot colocando tu pieza…", "#fab387")
 
     def on_game_over(self, result: str):
         self.disable_human_turn()
@@ -423,7 +431,8 @@ class BoardWidget(QWidget):
 
         # Deshabilitar tablero hasta que el robot termine
         self.disable_human_turn()
-        self._status_bar.set_turn("Turno del robot…", _BLUE)
+        # Texto genérico: en normal el robot mueve su pieza, en teleop la del humano
+        self._status_bar.set_turn("Robot en movimiento…", _BLUE)
 
         # Notificar al GameNode
         self.move_confirmed.emit(cell)
