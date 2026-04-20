@@ -1,18 +1,17 @@
 """
 gui/setup_widget.py
 ────────────────────
-Ventana de configuración inicial del juego.
-Se muestra sola al arrancar; al pulsar Start se cierra y abre MainWindow.
+Initial game setup window.
+Shown on startup; pressing Start closes it and opens MainWindow.
 
-Señal emitida:
+Emitted signal:
     start_requested(symbol: str, difficulty: float, teleop: bool)
 
-Modos:
-  • Normal   → IA decide y robot mueve solo en su turno.
-  • Teleop   → el robot ejecuta TODAS las piezas (humano + IA).
-               La sección de dificultad se oculta (la IA sigue jugando
-               internamente para saber dónde va la pieza del robot, pero
-               en teleop la dificultad no tiene sentido exponer).
+Modes:
+  • Normal → AI decides and the robot moves only on its own turn.
+  • Teleop → the robot executes all pieces (human + AI).
+             The difficulty section is hidden because difficulty does
+             not need to be exposed in teleop mode.
 """
 
 from PyQt6.QtWidgets import (
@@ -24,16 +23,19 @@ from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui  import QFont
 
 
-# ─────────────────────────────────────────────────── paleta / constantes
+# ─────────────────────────────────────────────────── palette / constants
 
 _BG           = "#11111b"
 _SURFACE      = "#1e1e2e"
 _SURFACE2     = "#181825"
 _BORDER       = "#313244"
-_ACCENT_BLUE  = "#89b4fa"
-_ACCENT_PINK  = "#f38ba8"
-_ACCENT_TEAL  = "#94e2d5"
-_ACCENT_PEACH = "#fab387"   # naranja — modo teleop
+_ACCENT_BLUE  = "#1d4ed8"
+_ACCENT_PINK  = "#dc2626"
+_ACCENT_TEAL  = "#2dd4bf"
+_ACCENT_PEACH = "#fab387"   # orange for teleop mode
+_ACCENT_GREEN = "#10b981"
+_ACCENT_GOLD  = "#0ea5e9"
+_ACCENT_VIOLET = "#f59e0b"
 _TEXT         = "#cdd6f4"
 _SUBTEXT      = "#6c7086"
 _GREEN        = "#a6e3a1"
@@ -55,9 +57,16 @@ def _h_line() -> QFrame:
 # ────────────────────────────────────────────────────── ToggleButton
 
 class ToggleButton(QPushButton):
-    def __init__(self, label: str, sublabel: str = "", accent: str = _ACCENT_BLUE):
+    def __init__(
+        self,
+        label: str,
+        sublabel: str = "",
+        accent: str = _ACCENT_BLUE,
+        fill_alpha: str = "22",
+    ):
         super().__init__()
         self._accent = accent
+        self._fill_alpha = fill_alpha
         self.setCheckable(True)
         self.setFont(_FONT_BUTTON)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -70,10 +79,10 @@ class ToggleButton(QPushButton):
         if checked:
             self.setStyleSheet(f"""
                 QPushButton {{
-                    background: {self._accent}22;
+                    background: {self._accent}{self._fill_alpha};
                     border: 2px solid {self._accent};
                     border-radius: 10px;
-                    color: {self._accent};
+                    color: {_TEXT};
                     padding: 8px 16px;
                 }}
             """)
@@ -125,8 +134,8 @@ class SectionCard(QFrame):
 
 class SetupDialog(QDialog):
     """
-    Diálogo modal de configuración.
-    Acepta → emite start_requested y se cierra.
+    Modal setup dialog.
+    Accept → emit start_requested and close.
     """
 
     # symbol, difficulty, teleop
@@ -140,7 +149,7 @@ class SetupDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("TicTacToe × UR3 — Configuración")
+        self.setWindowTitle("TicTacToe × UR3 — Setup")
         self.setModal(True)
         self.setMinimumWidth(540)
         self.setStyleSheet(f"background: {_BG};")
@@ -158,7 +167,7 @@ class SetupDialog(QDialog):
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(18)
 
-        # Título
+        # Title
         title = QLabel("TICTACTOE  ×  UR3 CB3")
         title.setFont(_FONT_BIG)
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -171,7 +180,7 @@ class SetupDialog(QDialog):
         subtitle.setStyleSheet(f"color: {_SUBTEXT};")
         root.addWidget(subtitle)
 
-        # ── Modo de operación ───────────────────────────────────────────
+        # ── operation mode ─────────────────────────────────────────────
         mode_card = SectionCard("// MODE")
         mode_row  = QHBoxLayout()
         mode_row.setSpacing(12)
@@ -179,7 +188,8 @@ class SetupDialog(QDialog):
         self._btn_normal = ToggleButton(
             "🤖  Normal",
             "AI moves its own pieces",
-            _ACCENT_BLUE,
+            _ACCENT_GREEN,
+            "3d",
         )
         self._btn_teleop = ToggleButton(
             "🕹️  Teleop",
@@ -197,10 +207,10 @@ class SetupDialog(QDialog):
         mode_row.addWidget(self._btn_teleop)
         mode_card.inner.addLayout(mode_row)
 
-        # Nota explicativa del modo teleop
+        # Teleop explanation note
         self._teleop_note = QLabel(
-            "⚠  En modo teleop el robot ejecuta físicamente TODAS las piezas —\n"
-            "    las tuyas y las suyas. Tú decides en el tablero; el brazo actúa."
+            "⚠  In teleop mode the robot physically executes ALL pieces —\n"
+            "    yours and its own. You choose on the board; the arm performs them."
         )
         self._teleop_note.setFont(_FONT_SMALL)
         self._teleop_note.setStyleSheet(
@@ -210,13 +220,13 @@ class SetupDialog(QDialog):
         mode_card.inner.addWidget(self._teleop_note)
         root.addWidget(mode_card)
 
-        # ── Símbolo ─────────────────────────────────────────────────────
+        # ── symbol ─────────────────────────────────────────────────────
         sym_card = SectionCard("// CHOOSE YOUR SYMBOL")
         sym_row  = QHBoxLayout()
         sym_row.setSpacing(12)
 
-        self._btn_x = ToggleButton("✕  Play as X", "goes first (usually)", _ACCENT_PINK)
-        self._btn_o = ToggleButton("○  Play as O", "goes second",           _ACCENT_TEAL)
+        self._btn_x = ToggleButton("✕  Play as X", accent=_ACCENT_BLUE, fill_alpha="34")
+        self._btn_o = ToggleButton("○  Play as O", accent=_ACCENT_PINK, fill_alpha="34")
 
         self._sym_group = QButtonGroup(self)
         self._sym_group.setExclusive(True)
@@ -229,7 +239,7 @@ class SetupDialog(QDialog):
         sym_card.inner.addLayout(sym_row)
         root.addWidget(sym_card)
 
-        # ── Dificultad (oculta en teleop) ────────────────────────────────
+        # ── difficulty (hidden in teleop) ──────────────────────────────
         self._diff_card = SectionCard("// DIFFICULTY")
         diff_row        = QHBoxLayout()
         diff_row.setSpacing(12)
@@ -240,11 +250,12 @@ class SetupDialog(QDialog):
 
         configs = [
             ("Easy",   "75% random moves",   _ACCENT_TEAL),
-            ("Medium", "50% random moves",   _ACCENT_BLUE),
-            ("Hard",   "perfect Minimax AI", _ACCENT_PINK),
+            ("Medium", "50% random moves",   _ACCENT_GOLD),
+            ("Hard",   "perfect Minimax AI", _ACCENT_VIOLET),
         ]
         for name, sub, accent in configs:
-            btn = ToggleButton(name, sub, accent)
+            fill_alpha = "3d" if name == "Medium" else "22"
+            btn = ToggleButton(name, sub, accent, fill_alpha)
             self._diff_btns[name] = btn
             self._diff_group.addButton(btn)
             diff_row.addWidget(btn)
@@ -253,14 +264,14 @@ class SetupDialog(QDialog):
         self._diff_card.inner.addLayout(diff_row)
         root.addWidget(self._diff_card)
 
-        # ── Info dinámica ────────────────────────────────────────────────
+        # ── dynamic info ───────────────────────────────────────────────
         self._info_lbl = QLabel(self._info_text())
         self._info_lbl.setFont(_FONT_SMALL)
         self._info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._info_lbl.setStyleSheet(f"color: {_SUBTEXT};")
         root.addWidget(self._info_lbl)
 
-        # ── Botón Start ──────────────────────────────────────────────────
+        # ── Start button ───────────────────────────────────────────────
         self._start_btn = QPushButton("▶  START GAME")
         self._start_btn.setFont(QFont("JetBrains Mono", 12, QFont.Weight.Bold))
         self._start_btn.setMinimumHeight(52)
@@ -278,7 +289,7 @@ class SetupDialog(QDialog):
         """)
         root.addWidget(self._start_btn)
 
-        # ── Conexiones ───────────────────────────────────────────────────
+        # ── connections ─────────────────────────────────────────────────
         self._btn_normal.toggled.connect(self._on_mode_changed)
         self._btn_teleop.toggled.connect(self._on_mode_changed)
         self._btn_x.toggled.connect(self._on_symbol_changed)

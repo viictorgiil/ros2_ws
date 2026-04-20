@@ -1,31 +1,23 @@
 """
-game_node.py  ─  versión con action client y parada de emergencia (v2)
+game_node.py  ─  action-client version with emergency stop (v2)
 ───────────────────────────────────────────────────────────────────────
-Diseño de emergencia corregido:
+Corrected emergency-stop design:
 
-  PROBLEMA ANTERIOR
-  ─────────────────
-  1. El diálogo aparecía tarde porque emergency_confirmed solo se emitía
-     cuando ROS2 procesaba el cancel_callback — lo cual requería que el
-     hilo del servidor terminase primero (el sleep no era interrumpible
-     desde el executor).
-  2. Al reanudar, resume_after_emergency() relanzaba _do_ai_turn() completo
-     → doble movimiento porque el pick-and-place ya había terminado.
+  PREVIOUS PROBLEM
+  ────────────────
+  1. The dialog appeared late because emergency_confirmed was emitted only
+     when ROS 2 processed cancel_callback, which required the server thread
+     to finish first.
+  2. On resume, resume_after_emergency() relaunched the full _do_ai_turn()
+     and repeated a move that had already physically completed.
 
-  SOLUCIÓN
-  ─────────
-  • El botón STOP emite emergency_confirmed INMEDIATAMENTE en el hilo Qt
-    (sin esperar a ROS2). El diálogo aparece al instante.
-  • Se introduce _emergency_event (threading.Event) que los hilos de
-    movimiento comprueban; cuando se activa, _call_place_piece devuelve
-    False y el hilo sale.
-  • Se introduce _move_was_completed (bool): se pone a True justo DESPUÉS
-    de que _call_place_piece retorna True (movimiento físico terminado).
-    emergency_stop() lo lee para saber si el robot ya acabó o no.
-  • resume_after_emergency() usa _move_was_completed para decidir:
-      - True  → el movimiento ya terminó; solo hay que continuar con
-                 el resto de la secuencia (make_move + siguiente turno).
-      - False → el movimiento fue interrumpido; relanzar _call_place_piece.
+  SOLUTION
+  ────────
+  • The STOP button emits emergency_confirmed immediately on the Qt thread.
+  • _emergency_event tells movement threads to stop as soon as possible.
+  • _move_was_completed becomes True only after the physical movement ends.
+  • resume_after_emergency() uses that state to decide whether to continue
+    game logic or retry the interrupted physical action.
 """
 
 import sys
@@ -55,7 +47,7 @@ class RosSignalBridge(QObject):
     ai_thinking          = pyqtSignal(int)
     human_turn_started   = pyqtSignal()
     robot_placing_human  = pyqtSignal()
-    emergency_confirmed  = pyqtSignal()   # emitido INMEDIATAMENTE al pulsar STOP
+    emergency_confirmed  = pyqtSignal()   # emitted immediately when STOP is pressed
     reset_completed      = pyqtSignal()
 
 
@@ -70,21 +62,19 @@ class GameNode(Node):
         self._ai_turn       = False
         self._last_human_cell: int | None = None
 
-        # ── Estado de emergencia ────────────────────────────────────────
-        # _emergency_event: activo → los hilos de movimiento deben parar
+        # ── emergency state ────────────────────────────────────────────
+        # _emergency_event: active -> movement threads must stop
         self._emergency_event = threading.Event()
-        # _move_was_completed: el _call_place_piece terminó (físico OK).
+        # _move_was_completed: _call_place_piece completed physically.
         self._move_was_completed = False
-        # _move_logic_applied: make_move + move_completed.emit ya ejecutados.
-        # Necesario para que _continue_after_completed_move no los repita
-        # si la emergencia llegó después de que el hilo original los completó.
+        # _move_logic_applied: make_move + move_completed.emit already done.
         self._move_logic_applied = False
-        # _pending_symbol / _pending_cell: qué movimiento estaba en curso
-        # al pulsar STOP (para poder reanudarlo si no había terminado)
+        # _pending_symbol / _pending_cell: move that was in progress when
+        # STOP was pressed so it can be resumed if needed.
         self._pending_symbol: str = ""
         self._pending_cell_idx: int = -1
 
-        # Goal handle activo (para cancelar en el action server del robot)
+        # Active goal handle used to cancel the robot action server goal
         self._active_goal_handle = None
         self._goal_lock          = threading.Lock()
 
@@ -104,12 +94,18 @@ class GameNode(Node):
         ready = self._place_client.wait_for_server(timeout_sec=5.0)
         if not ready:
             self.get_logger().warning(
-                "robot_controller no disponible — modo simulación."
+                "robot_controller not available — simulation mode."
             )
 
-    # ── API pública ────────────────────────────────────────────────────
+    # ── public API ─────────────────────────────────────────────────────
 
-    def start_game(self, human_symbol: str, difficulty: float, teleop: bool = False):
+    def start_game(
+        self,
+        human_symbol: str,
+        difficulty: float,
+        teleop: bool = False,
+        ai_starts: bool | None = None,
+    ):
         self._game              = TicTacToe()
         self._game.random_prob  = difficulty
         self._game.human_player = human_symbol
@@ -121,7 +117,7 @@ class GameNode(Node):
         self._move_logic_applied = False
 
         import random
-        self._ai_turn = random.choice([True, False])
+        self._ai_turn = random.choice([True, False]) if ai_starts is None else ai_starts
 
         if self._ai_turn:
             self._bridge.robot_status_changed.emit("BUSY")
@@ -155,65 +151,55 @@ class GameNode(Node):
 
     def emergency_stop(self):
         """
-        Parada de emergencia.
+        Emergency stop.
 
-        1. Activa _emergency_event → los hilos de movimiento salen en
-           el próximo ciclo de comprobación.
-        2. Cancela el goal activo en el action server (para parar el UR3).
-        3. Emite emergency_confirmed INMEDIATAMENTE → la GUI muestra el
-           diálogo sin esperar a que ROS2 confirme la cancelación.
+        1. Set _emergency_event so movement threads exit on their next check.
+        2. Cancel the active action-server goal to stop the UR3.
+        3. Emit emergency_confirmed immediately so the GUI can react.
         """
-        self.get_logger().warn("⛔ emergency_stop() activado.")
+        self.get_logger().warn("⛔ emergency_stop() activated.")
         self._game_started = False
         self._emergency_event.set()
 
-        # Cancelar goal en el servidor (asíncrono, no bloqueamos)
+        # Cancel the action-server goal asynchronously
         with self._goal_lock:
             gh = self._active_goal_handle
         if gh is not None:
             gh.cancel_goal_async()
 
-        # Emitir inmediatamente — el diálogo no espera a ROS2
+        # Emit immediately; the dialog does not wait for ROS 2
         self._bridge.emergency_confirmed.emit()
 
-        # NO tocar _move_was_completed ni _move_logic_applied aquí:
-        # el hilo de movimiento los habrá fijado ya (o no) de forma atómica
-        # antes de salir. Modificarlos aquí crearía una race condition.
+        # Do not touch _move_was_completed or _move_logic_applied here.
 
     def resume_after_emergency(self):
         """
-        Reanudar tras emergencia.
+        Resume after emergency.
 
-        Si _move_was_completed es True: el robot ya terminó el movimiento
-        físico antes de que se procesase la emergencia. Solo hay que
-        continuar con la lógica de juego (make_move + siguiente turno).
-
-        Si _move_was_completed es False: el movimiento fue interrumpido.
-        Hay que relanzar _call_place_piece con el mismo symbol/cell.
+        If _move_was_completed is True, only continue game logic.
+        If False, retry the interrupted physical move.
         """
         self._game_started = True
         self._emergency_event.clear()
         self.get_logger().info(
-            f"▶ Reanudando. move_was_completed={self._move_was_completed} "
+            f"▶ Resuming. move_was_completed={self._move_was_completed} "
             f"move_logic_applied={self._move_logic_applied}"
         )
 
         if self._move_logic_applied:
-            # El hilo original ya hizo make_move + move_completed.emit.
-            # Solo hay que continuar con el siguiente turno.
+            # The original thread already applied game logic.
             threading.Thread(
                 target=self._continue_after_logic_applied,
                 daemon=True,
             ).start()
         elif self._move_was_completed:
-            # El movimiento físico terminó pero la lógica de juego no.
-            # Aplicar make_move + siguiente turno sin repetir el place.
+            # Physical move completed but game logic did not.
             threading.Thread(
                 target=self._continue_after_completed_move,
                 daemon=True,
             ).start()
         else:
-            # El movimiento fue interrumpido — repetir _call_place_piece.
+            # The physical move was interrupted.
             threading.Thread(
                 target=self._retry_interrupted_move,
                 daemon=True,
@@ -222,36 +208,33 @@ class GameNode(Node):
     def go_home_and_reset(self):
         threading.Thread(target=self._do_go_home, daemon=True).start()
 
-    # ── lógica de reanudación ──────────────────────────────────────────
+    # ── resume logic ───────────────────────────────────────────────────
 
     def _continue_after_logic_applied(self):
         """
-        El hilo original ya aplicó make_move + emitió move_completed.
-        Solo hay que continuar con el siguiente turno.
+        The original thread already applied game logic.
+        Only continue with the next turn.
         """
         if self._ai_turn:
-            # Era turno del robot → pasar al humano
+            # It was the robot turn -> switch to the human
             self._ai_turn = False
             self._bridge.robot_status_changed.emit("IDLE")
             self._bridge.human_turn_started.emit()
         else:
-            # Era turno teleop (pieza del humano) → turno del robot
+            # It was a teleop human piece -> switch to the robot
             self._ai_turn = True
             self._do_ai_turn()
 
     def _continue_after_completed_move(self):
         """
-        El pick-and-place terminó justo antes de la emergencia.
-        Registrar la jugada en el tablero lógico y pasar al siguiente turno.
-        La GUI ya no necesita on_move_completed porque la celda ya fue pintada
-        por el hilo original (si move_completed se emitió). Si no se emitió,
-        hay que emitirlo aquí. Usamos _move_logic_applied para saberlo.
+        The pick-and-place finished just before the emergency.
+        Register the move in game state and continue to the next turn.
         """
         symbol = self._pending_symbol
         cell   = self._pending_cell_idx
 
         if self._ai_turn:
-            # Era turno del robot: aplicar lógica y continuar al turno humano
+            # It was the robot turn: apply logic and continue to the human
             self._game.make_move(cell, self._game.ai_player)
             self._bridge.move_completed.emit(cell)
             self._move_logic_applied = True
@@ -260,7 +243,7 @@ class GameNode(Node):
                 self._bridge.robot_status_changed.emit("IDLE")
                 self._bridge.human_turn_started.emit()
         else:
-            # Era turno teleop (pieza del humano): aplicar lógica y pasar al robot
+            # It was a teleop human piece: apply logic and pass to the robot
             self._game.make_move(cell, self._game.human_player)
             self._bridge.move_completed.emit(cell)
             self._move_logic_applied = True
@@ -270,7 +253,7 @@ class GameNode(Node):
 
     def _retry_interrupted_move(self):
         """
-        El pick-and-place fue interrumpido. Repetir el movimiento físico.
+        The pick-and-place was interrupted. Retry the physical move.
         """
         symbol = self._pending_symbol
         cell   = self._pending_cell_idx
@@ -283,7 +266,7 @@ class GameNode(Node):
 
         ok = self._call_place_piece(symbol, cell)
         if not ok:
-            return   # nueva emergencia
+            return   # new emergency
 
         if self._emergency_event.is_set():
             self._move_was_completed = False
@@ -307,7 +290,7 @@ class GameNode(Node):
                 self._ai_turn = True
                 self._do_ai_turn()
 
-    # ── callbacks internos ─────────────────────────────────────────────
+    # ── internal callbacks ─────────────────────────────────────────────
 
     def _feedback_cb(self, feedback_msg):
         phase = feedback_msg.feedback.phase
@@ -316,13 +299,12 @@ class GameNode(Node):
     def _status_callback(self, msg: String):
         self._bridge.robot_status_changed.emit(msg.data)
 
-    # ── secuencias de movimiento ───────────────────────────────────────
+    # ── movement sequences ─────────────────────────────────────────────
 
     def _do_go_home(self):
-        self.get_logger().info("🏠 Enviando robot a home…")
+        self.get_logger().info("🏠 Sending robot home...")
 
-        # Limpiar evento de emergencia para que el goal HOME no sea bloqueado
-        # por comprobaciones internas de _call_place_piece.
+        # Clear the emergency event so the HOME goal is not blocked.
         self._emergency_event.clear()
 
         if not self._place_client.server_is_ready():
@@ -334,9 +316,8 @@ class GameNode(Node):
         goal.symbol     = "HOME"
         goal.cell_index = -1
 
-        # El servidor puede estar terminando de procesar la cancelación anterior
-        # (_active_goal_handle todavía no es None). Reintentar hasta que acepte.
-        for attempt in range(20):  # hasta ~2 segundos
+        # The server may still be finishing the previous cancellation.
+        for attempt in range(20):  # up to ~2 seconds
             future = self._place_client.send_goal_async(goal)
             while not future.done():
                 time.sleep(0.05)
@@ -345,11 +326,11 @@ class GameNode(Node):
             if gh.accepted:
                 break
             self.get_logger().warning(
-                f"Goal HOME rechazado (intento {attempt + 1}/20), reintentando…"
+                f"HOME goal rejected (attempt {attempt + 1}/20), retrying..."
             )
             time.sleep(0.1)
         else:
-            self.get_logger().error("Goal HOME rechazado tras todos los intentos.")
+            self.get_logger().error("HOME goal rejected after all attempts.")
             self._bridge.reset_completed.emit()
             return
 
@@ -357,7 +338,7 @@ class GameNode(Node):
         while not result_future.done():
             time.sleep(0.05)
 
-        self.get_logger().info("🏠 Robot en home.")
+        self.get_logger().info("🏠 Robot at home.")
         self._bridge.reset_completed.emit()
 
     def _do_human_teleop_move(self, cell_index: int):
@@ -372,7 +353,7 @@ class GameNode(Node):
 
         ok = self._call_place_piece(self._game.human_player, cell_index)
         if not ok:
-            return   # emergencia — hilo sale; resume_after_emergency continuará
+            return   # emergency; resume_after_emergency will continue
 
         if self._emergency_event.is_set():
             self._move_was_completed = False
@@ -381,7 +362,7 @@ class GameNode(Node):
         self._move_was_completed = True
         self._game.make_move(cell_index, self._game.human_player)
         self._bridge.move_completed.emit(cell_index)
-        self._move_logic_applied = True   # ← punto de corte atómico
+        self._move_logic_applied = True
 
         if self._check_game_over():
             return
@@ -400,7 +381,7 @@ class GameNode(Node):
 
         ok = self._call_place_piece(self._game.ai_player, move)
         if not ok:
-            return   # emergencia
+            return   # emergency
 
         if self._emergency_event.is_set():
             self._move_was_completed = False
@@ -408,13 +389,11 @@ class GameNode(Node):
 
         self._move_was_completed = True
 
-        # Aplicar lógica de juego. Si la emergencia llega entre _move_was_completed=True
-        # y _move_logic_applied=True, _continue_after_completed_move la aplicará.
-        # Si llega después de _move_logic_applied=True, _continue_after_logic_applied
-        # solo continuará con el siguiente turno sin repetir nada.
+        # Apply game logic. If emergency arrives between _move_was_completed
+        # and _move_logic_applied, resume logic will handle the gap.
         self._game.make_move(move, self._game.ai_player)
         self._bridge.move_completed.emit(move)
-        self._move_logic_applied = True   # ← punto de corte atómico
+        self._move_logic_applied = True
 
         if not self._check_game_over():
             self._ai_turn = False
@@ -432,12 +411,12 @@ class GameNode(Node):
 
     def _call_place_piece(self, symbol: str, cell_index: int) -> bool:
         """
-        Envía goal y espera resultado.
-        Comprueba _emergency_event en cada iteración del bucle de espera.
-        Retorna True si completado, False si emergencia o error.
+        Send a goal and wait for the result.
+        Check _emergency_event in each wait loop iteration.
+        Return True on success, False on emergency or error.
         """
         if not self._place_client.server_is_ready():
-            # Simulación: sleep interruptible por emergencia
+            # Simulation: emergency-interruptible sleep
             for _ in range(30):
                 if self._emergency_event.is_set():
                     return False
@@ -453,8 +432,7 @@ class GameNode(Node):
         )
         while not send_future.done():
             if self._emergency_event.is_set():
-                # No tenemos goal handle todavía. Esperar a tenerlo en background
-                # para mandar el cancel al servidor y que realmente pare.
+                # We do not have the goal handle yet. Cancel once ready.
                 def _cancel_when_ready(f):
                     try:
                         _gh = f.result()
@@ -468,10 +446,10 @@ class GameNode(Node):
 
         gh = send_future.result()
         if not gh.accepted:
-            self.get_logger().error("Goal rechazado.")
+            self.get_logger().error("Goal rejected.")
             return False
 
-        # Emergencia llegó exactamente mientras se resolvía send_future
+        # Emergency arrived exactly as send_future resolved
         if self._emergency_event.is_set():
             gh.cancel_goal_async()
             return False
@@ -482,7 +460,7 @@ class GameNode(Node):
         result_future = gh.get_result_async()
         while not result_future.done():
             if self._emergency_event.is_set():
-                # Cancelar en el servidor también
+                # Also cancel on the server side
                 gh.cancel_goal_async()
                 with self._goal_lock:
                     self._active_goal_handle = None
@@ -496,9 +474,8 @@ class GameNode(Node):
 
         from action_msgs.msg import GoalStatus
 
-        # 🔥 CLAVE ABSOLUTA
         if self._emergency_event.is_set():
-            self.get_logger().warn("Resultado ignorado por emergencia.")
+            self.get_logger().warn("Result ignored due to emergency.")
             return False
 
         if result.status == GoalStatus.STATUS_CANCELED:
@@ -523,26 +500,23 @@ def main(args=None):
     ros_thread = threading.Thread(target=executor.spin, daemon=True)
     ros_thread.start()
 
-    # _current_window mantiene la referencia viva — sin esto el GC destruye
-    # la ventana nueva creada tras un reinicio antes de que Qt la procese.
+    # Keep the current window alive so it is not garbage-collected on reset.
     _current_window: list = [None]
 
     def _on_reset_completed():
         """
-        Llamado desde el hilo Qt cuando el robot llega a home.
-        Desconecta y destruye la ventana activa, luego relanza SetupDialog.
-        Vivir en main() garantiza que la referencia a la nueva ventana
-        se guarda correctamente y no es destruida por el GC.
+        Called on the Qt thread when the robot reaches home.
+        Destroy the active window and relaunch SetupDialog.
         """
         old = _current_window[0]
         if old is not None:
-            old._disconnect_bridge()   # desconectar señales antes de destruir
+            old._disconnect_bridge()
             old.close()
             old.deleteLater()
             _current_window[0] = None
 
         new_window = launch_app(bridge, node)
-        _current_window[0] = new_window   # mantener referencia viva
+        _current_window[0] = new_window
 
     bridge.reset_completed.connect(_on_reset_completed)
 

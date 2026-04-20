@@ -36,19 +36,19 @@ def generate_launch_description():
         parameters = [{"simulate": LaunchConfiguration("simulate")}],
     )
 
-    # game_node = Node(
-    #     package    = "tictactoe_robot",
-    #     executable = "game_node",
-    #     name       = "game_node",
-    #     output     = "screen",
-    #     # Allows terminal I/O (stdin) to reach the node
-    #     additional_env = {"PYTHONUNBUFFERED": "1"},
-    #     emulate_tty    = True,
-    # )
+    game_node = Node(
+        package    = "tictactoe_robot",
+        executable = "game_node",
+        name       = "game_node",
+        output     = "screen",
+        # Allows terminal I/O (stdin) to reach the node
+        additional_env = {"PYTHONUNBUFFERED": "1"},
+        emulate_tty    = True,
+    )
 
     return LaunchDescription([
         sim_arg,
         LogInfo(msg="[TicTacToe] Launching robot_controller and game_node…"),
-        robot_controller_node#,
-        #game_node,
+        robot_controller_node,
+        game_node,
     ])

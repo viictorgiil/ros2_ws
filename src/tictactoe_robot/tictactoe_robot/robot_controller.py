@@ -3,28 +3,25 @@ robot_controller.py
 ────────────────────
 ROS2 node  'robot_controller'
 
-Modos de operación
-───────────────────
-  simulate:=false (por defecto en lab)
-    → Conecta con el action server UR3 y el servicio SetIO reales.
+Operating modes
+───────────────
+  simulate:=false (lab default)
+    → Connect to the real UR3 action server and SetIO service.
 
-  simulate:=true  (sin robot)
-    → Omite toda comunicación con hardware.
-      Los movimientos se simulan con time.sleep().
-      Publica robot_status igual que en modo real.
+  simulate:=true (without robot)
+    → Skip all hardware communication.
+      Movements are simulated with time.sleep().
+      Publishes robot_status exactly as in real mode.
 
-Parada de emergencia
-─────────────────────
-  El goal de PlacePiece puede cancelarse en cualquier momento via
-  goal_handle.cancel_goal_async() desde game_node.py.
-  Cuando se cancela:
-    • Se interrumpe el movimiento actual entre waypoints.
-    • La pinza se abre (suelta la pieza si la tenía).
-    • Se publica robot_status = "EMERGENCY_STOP".
-  Si se reanuda (nuevo goal con mismo symbol/cell), el pick-and-place
-  comienza desde el principio (home → stock → cell).
-  Si se reinicia, game_node envía el robot a home mediante GoHome.action
-  (o simplemente un nuevo goal con symbol="" que se ignora).
+Emergency stop
+──────────────
+  The PlacePiece goal can be canceled at any time from game_node.py.
+  When canceled:
+    • the current movement is interrupted between waypoints
+    • the gripper state is left unchanged
+    • robot_status = "EMERGENCY_STOP" is published
+  On resume, the controller continues from the interrupted sequence step.
+  On restart, game_node sends the robot back home.
 """
 
 import json
@@ -94,13 +91,13 @@ class RobotController(Node):
         super().__init__("robot_controller")
         cbg = ReentrantCallbackGroup()
 
-        # ── Parámetro simulate ──────────────────────────────────────────
+        # ── simulate parameter ─────────────────────────────────────────
         self.declare_parameter("simulate", False)
         self._simulate: bool = self.get_parameter("simulate").value
         mode_str = "SIMULATION 🖥️" if self._simulate else "REAL HARDWARE 🤖"
         self.get_logger().info(f"Operation Mode: {mode_str}")
 
-        # ── Cargar posiciones ───────────────────────────────────────────
+        # ── Load positions ───────────────────────────────────────────
         try:
             pkg_path       = get_package_share_directory("tictactoe_robot")
             positions_file = Path(pkg_path) / "positions.json"
@@ -117,32 +114,32 @@ class RobotController(Node):
             f"{len(self.positions)} positions loaded from {positions_file}"
         )
 
-        # ── Contador de piezas ──────────────────────────────────────────
+        # ── piece counter ──────────────────────────────────────────────
         self._stock_index: dict[str, int] = {"X": 1, "O": 1}
 
-        # ── Hardware (solo si no simulamos) ────────────────────────────
+        # ── Hardware (only if not added simulate:=true) ────────────────────────────
         if not self._simulate:
             self._ur_client = ActionClient(
                 self, FollowJointTrajectory, UR_ACTION, callback_group=cbg
             )
-            self.get_logger().info("Esperando action server del UR3…")
+            self.get_logger().info("Waiting for the UR3 action server...")
             self._ur_client.wait_for_server()
-            self.get_logger().info("✅ Action server UR3 listo.")
+            self.get_logger().info("✅ Action server UR3 ready.")
 
             self._io_client = self.create_client(
                 SetIO, SETIO_SERVICE, callback_group=cbg
             )
-            self.get_logger().info("Esperando servicio SetIO de la pinza…")
+            self.get_logger().info("Waiting for the gripper SetIO service...")
             self._io_client.wait_for_service()
-            self.get_logger().info("✅ Servicio SetIO listo.")
+            self.get_logger().info("✅ SetIO Service ready.")
         else:
             self._ur_client = None
             self._io_client = None
             self.get_logger().info(
-                "⚡ Modo simulación activo — hardware omitido."
+                "⚡ Simulation mode enabled — hardware skipped."
             )
 
-        # ── Publisher de estado ─────────────────────────────────────────
+        # ── State Publisher ─────────────────────────────────────────
         self._status_pub = self.create_publisher(String, "~/robot_status", 10)
 
         # ── Action server place_piece ───────────────────────────────────
@@ -156,29 +153,30 @@ class RobotController(Node):
             callback_group=cbg,
         )
 
-        # Goal activo en ejecución (para cancelación)
+        # Active goal currently executing
         self._active_goal_handle = None
         self._cancel_requested   = threading.Event()
+        self._resume_context: dict[str, int | str] | None = None
 
         self.get_logger().info(
-            "RobotController listo. Action server ~/place_piece activo."
+            "RobotController ready. Action server ~/place_piece active."
         )
 
     # ─────────────────────────────────────── callbacks del action server
 
     def _goal_callback(self, goal_request):
-        """Acepta cualquier goal.
-        Rechaza si hay un goal activo, EXCEPTO si ya se ha solicitado cancelación
-        (en ese caso el execute está a punto de terminar y el HOME debe pasar).
+        """Accept any goal.
+        Reject if another goal is active, unless cancellation has already been
+        requested and the current execute callback is about to finish.
         """
         if self._active_goal_handle is not None and not self._cancel_requested.is_set():
-            self.get_logger().warning("Goal rechazado: ya hay un movimiento en curso.")
+            self.get_logger().warning("Goal rejected: another move is already active.")
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, goal_handle):
-        """Acepta siempre la petición de cancelación."""
-        self.get_logger().info("⛔ Cancelación de goal solicitada (emergencia).")
+        """Always accept a cancellation request."""
+        self.get_logger().info("⛔ Goal cancellation requested (emergency).")
         self._cancel_requested.set()
         return CancelResponse.ACCEPT
 
@@ -191,38 +189,50 @@ class RobotController(Node):
         cell_index = goal_handle.request.cell_index
 
         self.get_logger().info(
-            f"PlacePiece goal recibido: símbolo='{symbol}' celda={cell_index}"
+            f"PlacePiece goal received: symbol='{symbol}' cell={cell_index}"
         )
 
         result = PlacePiece.Result()
 
-        # Goal especial: volver a home (usado en reinicio tras emergencia)
+        # Special goal: return home after an emergency restart
         if symbol == "HOME":
+            self._resume_context = None
             try:
                 self.go_home()
             except Exception as e:
-                self.get_logger().error(f"go_home falló: {e}")
+                self.get_logger().error(f"go_home failed: {e}")
             goal_handle.succeed()
             result.success = True
-            result.message = "Robot en home"
+            result.message = "Robot at home"
             self._active_goal_handle = None
             return result
 
         try:
-            self._pick_and_place(symbol, cell_index, goal_handle)
+            start_step = 0
+            if (
+                self._resume_context is not None
+                and self._resume_context["symbol"] == symbol
+                and self._resume_context["cell_index"] == cell_index
+            ):
+                start_step = int(self._resume_context["next_step"])
+                self.get_logger().info(
+                    f"▶ Reanudando pick-and-place desde el paso {start_step}."
+                )
+            else:
+                self._resume_context = None
+
+            self._pick_and_place(symbol, cell_index, goal_handle, start_step)
         except _EmergencyStop:
-            self.get_logger().warn("⛔ Pick-and-place interrumpido por emergencia.")
-            # Abrir pinza para soltar la pieza, pero SIN comprobar _cancel_requested
-            # (ya está activo — _open_gripper lo lanzaría de nuevo).
-            self._open_gripper_safe()
+            self.get_logger().warn("⛔ Pick-and-place interrupted by emergency.")
             self._publish_status("EMERGENCY_STOP")
             goal_handle.canceled()
             result.success = False
-            result.message = "Parada de emergencia activada"
+            result.message = "Emergency stop activated"
             self._active_goal_handle = None
             return result
         except Exception as e:
             self.get_logger().error(str(e))
+            self._resume_context = None
             self._publish_status("IDLE")
             goal_handle.abort()
             result.success = False
@@ -233,32 +243,18 @@ class RobotController(Node):
         self._publish_status("IDLE")
         goal_handle.succeed()
         result.success = True
-        result.message = "Movimiento completado"
+        result.message = "Completed movement"
+        self._resume_context = None
         self._active_goal_handle = None
         return result
 
     # ─────────────────────────────────────── gripper
 
-    def _open_gripper_safe(self):
-        """Abre la pinza sin comprobar _cancel_requested.
-        Usar solo en el handler de emergencia para soltar la pieza."""
-        if self._simulate:
-            self.get_logger().info("  🤏 [SIM] Pinza: ABIERTA (safe)")
-            time.sleep(SIM_GRIPPER_TIME)
-            return
-        req = SetIO.Request()
-        req.fun   = 1
-        req.pin   = 0
-        req.state = 0.0
-        self._io_client.call_async(req)
-        self.get_logger().info("  🤏 Pinza: ABIERTA (safe)")
-        time.sleep(GRIPPER_WAIT)
-
     def _open_gripper(self):
         if self._cancel_requested.is_set():
             raise _EmergencyStop()
         if self._simulate:
-            self.get_logger().info("  🤏 [SIM] Pinza: ABIERTA")
+            self.get_logger().info("  🤏 [SIM] Gripper: OPEN")
             self._interruptible_sleep(SIM_GRIPPER_TIME)
             return
 
@@ -267,14 +263,14 @@ class RobotController(Node):
         req.pin   = 0
         req.state = 0.0
         self._io_client.call_async(req)
-        self.get_logger().info("  🤏 Pinza: ABIERTA")
+        self.get_logger().info("  🤏 Gripper: OPEN")
         self._interruptible_sleep(GRIPPER_WAIT)
 
     def _close_gripper(self):
         if self._cancel_requested.is_set():
             raise _EmergencyStop()
         if self._simulate:
-            self.get_logger().info("  🤏 [SIM] Pinza: CERRADA")
+            self.get_logger().info("  🤏 [SIM] Gripper: CLOSED")
             self._interruptible_sleep(SIM_GRIPPER_TIME)
             return
 
@@ -283,17 +279,17 @@ class RobotController(Node):
         req.pin   = 0
         req.state = 1.0
         self._io_client.call_async(req)
-        self.get_logger().info("  🤏 Pinza: CERRADA")
+        self.get_logger().info("  🤏 Gripper: CLOSED")
         self._interruptible_sleep(GRIPPER_WAIT)
 
-    # ─────────────────────────────────────── movimiento
+    # ─────────────────────────────────────── movement
 
     def _move_to(self, joints: list[float], label: str = "", phase: str = "",
                  goal_handle=None):
-        self.get_logger().info(f"  → Moviendo a '{label}'…")
+        self.get_logger().info(f"  → Moving to '{label}'…")
         self._publish_status(f"MOVING: {label}")
 
-        # Publicar feedback si hay goal_handle
+        # Publish feedback when a goal_handle exists
         if goal_handle is not None:
             fb = PlacePiece.Feedback()
             fb.phase    = phase or label
@@ -302,17 +298,17 @@ class RobotController(Node):
 
         if self._simulate:
             self._interruptible_sleep(SIM_WAYPOINT_TIME)
-            self.get_logger().info(f"  ✅ [SIM] Llegado a '{label}'")
+            self.get_logger().info(f"  ✅ [SIM] Reached '{label}'")
             return
 
-        # ── Modo real ───────────────────────────────────────────────────
+        # ── Real mode ───────────────────────────────────────────────────
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = UR3_JOINTS
         goal.trajectory.points      = [_make_point(joints, WAYPOINT_TIME)]
 
         goal_handle_future = self._ur_client.send_goal_async(goal)
 
-        # Esperar aceptación comprobando cancelación
+        # Wait for acceptance while checking cancellation
         while not goal_handle_future.done():
             if self._cancel_requested.is_set():
                 raise _EmergencyStop()
@@ -320,14 +316,14 @@ class RobotController(Node):
 
         ur_goal_handle = goal_handle_future.result()
         if not ur_goal_handle.accepted:
-            raise RuntimeError(f"Goal rechazado para '{label}'")
+            raise RuntimeError(f"Goal rejected for '{label}'")
 
         result_future = ur_goal_handle.get_result_async()
 
-        # Esperar resultado comprobando cancelación
+        # Wait for the result while checking cancellation
         while not result_future.done():
             if self._cancel_requested.is_set():
-                # Cancelar también el goal del UR3
+                # Also cancel the UR3 goal
                 ur_goal_handle.cancel_goal_async()
                 raise _EmergencyStop()
             time.sleep(0.05)
@@ -339,15 +335,21 @@ class RobotController(Node):
                 f"(error_code={result.result.error_code})"
             )
 
-        self.get_logger().info(f"  ✅ Llegado a '{label}'")
+        self.get_logger().info(f"  ✅ Reached '{label}'")
 
     # ─────────────────────────────────────── pick-and-place
 
-    def _pick_and_place(self, symbol: str, cell_index: int, goal_handle):
+    def _pick_and_place(
+        self,
+        symbol: str,
+        cell_index: int,
+        goal_handle,
+        start_step: int = 0,
+    ):
         idx = self._stock_index[symbol]
         if idx > STOCK_COUNT:
             raise RuntimeError(
-                f"¡Sin piezas para '{symbol}'! (máx {STOCK_COUNT})"
+                f"No pieces left for '{symbol}' (max {STOCK_COUNT})"
             )
 
         stock_key = (
@@ -363,46 +365,59 @@ class RobotController(Node):
         cell_approach  = _apply_approach(cell_joints)
 
         self.get_logger().info(
-            f"━━━ Pick-and-place │ símbolo='{symbol}' │ "
-            f"stock='{stock_key}' │ celda='{cell_key}' ━━━"
+            f"━━━ Pick-and-place │ symbol='{symbol}' │ "
+            f"stock='{stock_key}' │ cell='{cell_key}' ━━━"
         )
         self._publish_status("BUSY")
 
-        # Cada _move_to comprueba _cancel_requested internamente
-        self._move_to(home_joints,    "home",             "return_home",   goal_handle)
-        self._check_cancel()
-        self._move_to(stock_approach, f"{stock_key}_app", "approach_stock", goal_handle)
-        self._check_cancel()
-        self._open_gripper()
-        self._check_cancel()   # punto de cancelación entre movimientos
-        self._move_to(stock_joints,   stock_key,          "pick",           goal_handle)
-        self._check_cancel()
-        self._close_gripper()
-        self._check_cancel()
-        self._move_to(stock_approach, f"{stock_key}_app", "approach_stock", goal_handle)
-        self._check_cancel()
-        self._move_to(cell_approach,  f"{cell_key}_app",  "approach_cell",  goal_handle)
-        self._check_cancel()
-        self._move_to(cell_joints,    cell_key,           "place",          goal_handle)
-        self._check_cancel()
-        self._open_gripper()
-        self._check_cancel()
-        self._move_to(cell_approach,  f"{cell_key}_app",  "approach_cell",  goal_handle)
-        self._check_cancel()
-        self._move_to(home_joints,    "home",             "return_home",    goal_handle)
+        steps = [
+            lambda: self._move_to(home_joints, "home", "return_home", goal_handle),
+            lambda: self._move_to(
+                stock_approach, f"{stock_key}_app", "approach_stock", goal_handle
+            ),
+            self._open_gripper,
+            lambda: self._move_to(stock_joints, stock_key, "pick", goal_handle),
+            self._close_gripper,
+            lambda: self._move_to(
+                stock_approach, f"{stock_key}_app", "approach_stock", goal_handle
+            ),
+            lambda: self._move_to(
+                cell_approach, f"{cell_key}_app", "approach_cell", goal_handle
+            ),
+            lambda: self._move_to(cell_joints, cell_key, "place", goal_handle),
+            self._open_gripper,
+            lambda: self._move_to(
+                cell_approach, f"{cell_key}_app", "approach_cell", goal_handle
+            ),
+            lambda: self._move_to(home_joints, "home", "return_home", goal_handle),
+        ]
+
+        if start_step < 0 or start_step >= len(steps):
+            start_step = 0
+
+        for step_index in range(start_step, len(steps)):
+            self._resume_context = {
+                "symbol": symbol,
+                "cell_index": cell_index,
+                "next_step": step_index,
+            }
+            self._check_cancel()
+            steps[step_index]()
+
+        self._resume_context = None
 
         self._stock_index[symbol] += 1
-        self.get_logger().info("━━━ Secuencia completada ━━━")
+        self.get_logger().info("━━━ Sequence Completed ━━━")
 
     # ─────────────────────────────────────── helpers
 
     def _check_cancel(self):
-        """Lanza _EmergencyStop si se ha solicitado cancelación."""
+        """Raise _EmergencyStop if cancellation has been requested."""
         if self._cancel_requested.is_set():
             raise _EmergencyStop()
 
     def _interruptible_sleep(self, duration: float, step: float = 0.05):
-        """sleep() que se interrumpe si llega una cancelación."""
+        """Interruptible sleep that exits if cancellation arrives."""
         elapsed = 0.0
         while elapsed < duration:
             if self._cancel_requested.is_set():
@@ -415,24 +430,24 @@ class RobotController(Node):
         msg.data = status
         self._status_pub.publish(msg)
 
-    # ─────────────────────────────────────── go home (para reinicio)
+    # ─────────────────────────────────────── go home (for restart)
 
     def go_home(self):
-        """Mover el robot a home sin goal de PlacePiece (llamado en reinicio)."""
+        """Move the robot home without a PlacePiece goal."""
         home_joints = self.positions["home"]
         self._cancel_requested.clear()
         try:
             self._move_to(home_joints, "home", "return_home", goal_handle=None)
             self._publish_status("IDLE")
         except Exception as e:
-            self.get_logger().error(f"go_home falló: {e}")
+            self.get_logger().error(f"go_home failed: {e}")
             self._publish_status("IDLE")
 
 
-# ─────────────────────────────────────────────────────────────── excepción
+# ─────────────────────────────────────────────────────────────── exception
 
 class _EmergencyStop(Exception):
-    """Excepción interna para interrumpir pick-and-place."""
+    """Internal exception used to interrupt pick-and-place."""
 
 
 # ─────────────────────────────────────────────────────────────── main
@@ -440,10 +455,8 @@ class _EmergencyStop(Exception):
 def main(args=None):
     rclpy.init(args=args)
     node = RobotController()
-    # MultiThreadedExecutor es OBLIGATORIO: con rclpy.spin (single-thread) el
-    # cancel_callback nunca se despacha mientras _execute_place_piece está en
-    # curso, porque el único hilo del executor está ocupado en ese callback.
-    # Con MultiThreadedExecutor el cancel llega inmediatamente.
+    # MultiThreadedExecutor is required here. With single-threaded spin(),
+    # cancel_callback cannot run while _execute_place_piece is still executing.
     from rclpy.executors import MultiThreadedExecutor
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
