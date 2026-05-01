@@ -50,6 +50,7 @@ def generate_launch_description():
         executable = "game_node",
         name       = "game_node",
         output     = "screen",
+        parameters = [{"require_vision": LaunchConfiguration("vision")}],
         # Allows terminal I/O (stdin) to reach the node
         additional_env = {"PYTHONUNBUFFERED": "1"},
         emulate_tty    = True,

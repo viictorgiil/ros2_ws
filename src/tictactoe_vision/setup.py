@@ -7,7 +7,10 @@ setup(
     version='0.0.0',
     packages=find_packages(exclude=['test']),
     package_data={
-        package_name: ['hand_landmarker.task'],
+        package_name: [
+            'hand_landmarker.task',
+            'best.pt',
+        ],
     },
     include_package_data=True,
     data_files=[
@@ -15,7 +18,9 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+    ],
     zip_safe=True,
     maintainer='victor',
     maintainer_email='victor.gil.ferrer@gmail.com',

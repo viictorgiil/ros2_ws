@@ -40,7 +40,7 @@ from control_msgs.action    import FollowJointTrajectory
 from trajectory_msgs.msg    import JointTrajectoryPoint
 from ur_msgs.srv            import SetIO
 
-from tictactoe_interfaces.action import PlacePiece
+from tictactoe_interfaces.action import MovePiece, PlacePiece
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -48,6 +48,7 @@ from ament_index_python.packages import get_package_share_directory
 
 APPROACH_OFFSET = [-0.007, +0.1311, +0.2004, -0.3277, 0.0, 0.0]
 WAYPOINT_TIME   = 2.5
+FAST_WAYPOINT_TIME = 1.5
 GRIPPER_WAIT    = 1.0
 STOCK_COUNT     = 5
 
@@ -64,6 +65,7 @@ UR3_JOINTS = [
 ]
 
 SIM_WAYPOINT_TIME = 0.5
+FAST_SIM_WAYPOINT_TIME = 0.25
 SIM_GRIPPER_TIME  = 0.1
 
 
@@ -152,6 +154,15 @@ class RobotController(Node):
             cancel_callback=self._cancel_callback,
             callback_group=cbg,
         )
+        self._move_piece_server = ActionServer(
+            self,
+            MovePiece,
+            "~/move_piece",
+            execute_callback=self._execute_move_piece,
+            goal_callback=self._goal_callback,
+            cancel_callback=self._cancel_callback,
+            callback_group=cbg,
+        )
 
         # Active goal currently executing
         self._active_goal_handle = None
@@ -159,7 +170,8 @@ class RobotController(Node):
         self._resume_context: dict[str, int | str] | None = None
 
         self.get_logger().info(
-            "RobotController ready. Action server ~/place_piece active."
+            "RobotController ready. Action servers ~/place_piece and "
+            "~/move_piece active."
         )
 
     # ─────────────────────────────────────── callbacks del action server
@@ -211,8 +223,9 @@ class RobotController(Node):
             start_step = 0
             if (
                 self._resume_context is not None
-                and self._resume_context["symbol"] == symbol
-                and self._resume_context["cell_index"] == cell_index
+                and self._resume_context.get("mode") == "place_piece"
+                and self._resume_context.get("symbol") == symbol
+                and self._resume_context.get("cell_index") == cell_index
             ):
                 start_step = int(self._resume_context["next_step"])
                 self.get_logger().info(
@@ -244,6 +257,66 @@ class RobotController(Node):
         goal_handle.succeed()
         result.success = True
         result.message = "Completed movement"
+        self._resume_context = None
+        self._active_goal_handle = None
+        return result
+
+    def _execute_move_piece(self, goal_handle):
+        """Move a piece between two explicit physical slots."""
+        self._active_goal_handle = goal_handle
+        self._cancel_requested.clear()
+
+        source_slot = goal_handle.request.source_slot
+        target_slot = goal_handle.request.target_slot
+        fast = bool(goal_handle.request.fast)
+
+        self.get_logger().info(
+            f"MovePiece goal received: '{source_slot}' -> '{target_slot}' "
+            f"(fast={fast})"
+        )
+
+        result = MovePiece.Result()
+        try:
+            start_step = 0
+            if (
+                self._resume_context is not None
+                and self._resume_context.get("mode") == "move_piece"
+                and self._resume_context["source_slot"] == source_slot
+                and self._resume_context["target_slot"] == target_slot
+                and bool(self._resume_context.get("fast", False)) == fast
+            ):
+                start_step = int(self._resume_context["next_step"])
+                self.get_logger().info(
+                    f"Resuming explicit move from step {start_step}."
+                )
+            else:
+                self._resume_context = None
+
+            self._move_piece_between_slots(
+                source_slot, target_slot, goal_handle, start_step, fast
+            )
+        except _EmergencyStop:
+            self.get_logger().warn("MovePiece interrupted by emergency.")
+            self._publish_status("EMERGENCY_STOP")
+            goal_handle.canceled()
+            result.success = False
+            result.message = "Emergency stop activated"
+            self._active_goal_handle = None
+            return result
+        except Exception as e:
+            self.get_logger().error(str(e))
+            self._resume_context = None
+            self._publish_status("IDLE")
+            goal_handle.abort()
+            result.success = False
+            result.message = str(e)
+            self._active_goal_handle = None
+            return result
+
+        self._publish_status("IDLE")
+        goal_handle.succeed()
+        result.success = True
+        result.message = "Completed explicit move"
         self._resume_context = None
         self._active_goal_handle = None
         return result
@@ -285,26 +358,31 @@ class RobotController(Node):
     # ─────────────────────────────────────── movement
 
     def _move_to(self, joints: list[float], label: str = "", phase: str = "",
-                 goal_handle=None):
+                 goal_handle=None, fast: bool = False):
         self.get_logger().info(f"  → Moving to '{label}'…")
         self._publish_status(f"MOVING: {label}")
+        waypoint_time = FAST_WAYPOINT_TIME if fast else WAYPOINT_TIME
+        sim_waypoint_time = FAST_SIM_WAYPOINT_TIME if fast else SIM_WAYPOINT_TIME
 
         # Publish feedback when a goal_handle exists
         if goal_handle is not None:
-            fb = PlacePiece.Feedback()
+            if hasattr(goal_handle.request, "source_slot"):
+                fb = MovePiece.Feedback()
+            else:
+                fb = PlacePiece.Feedback()
             fb.phase    = phase or label
             fb.waypoint = 0
             goal_handle.publish_feedback(fb)
 
         if self._simulate:
-            self._interruptible_sleep(SIM_WAYPOINT_TIME)
+            self._interruptible_sleep(sim_waypoint_time)
             self.get_logger().info(f"  ✅ [SIM] Reached '{label}'")
             return
 
         # ── Real mode ───────────────────────────────────────────────────
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = UR3_JOINTS
-        goal.trajectory.points      = [_make_point(joints, WAYPOINT_TIME)]
+        goal.trajectory.points      = [_make_point(joints, waypoint_time)]
 
         goal_handle_future = self._ur_client.send_goal_async(goal)
 
@@ -397,6 +475,7 @@ class RobotController(Node):
 
         for step_index in range(start_step, len(steps)):
             self._resume_context = {
+                "mode": "place_piece",
                 "symbol": symbol,
                 "cell_index": cell_index,
                 "next_step": step_index,
@@ -408,6 +487,96 @@ class RobotController(Node):
 
         self._stock_index[symbol] += 1
         self.get_logger().info("━━━ Sequence Completed ━━━")
+
+    def _move_piece_between_slots(
+        self,
+        source_slot: str,
+        target_slot: str,
+        goal_handle,
+        start_step: int = 0,
+        fast: bool = False,
+    ):
+        source_key = self._slot_to_position_key(source_slot)
+        target_key = self._slot_to_position_key(target_slot)
+
+        source_joints = self.positions[source_key]
+        target_joints = self.positions[target_key]
+        home_joints = self.positions["home"]
+        source_approach = _apply_approach(source_joints)
+        target_approach = _apply_approach(target_joints)
+
+        self.get_logger().info(
+            f"━━━ Dynamic move │ {source_slot}({source_key}) -> "
+            f"{target_slot}({target_key}) │ fast={fast} ━━━"
+        )
+        self._publish_status("BUSY")
+
+        steps = [
+            lambda: self._move_to(
+                home_joints, "home", "return_home", goal_handle, fast
+            ),
+            lambda: self._move_to(
+                source_approach, f"{source_key}_app", "approach_source",
+                goal_handle, fast
+            ),
+            self._open_gripper,
+            lambda: self._move_to(
+                source_joints, source_key, "pick", goal_handle, fast
+            ),
+            self._close_gripper,
+            lambda: self._move_to(
+                source_approach, f"{source_key}_app", "approach_source",
+                goal_handle, fast
+            ),
+            lambda: self._move_to(
+                target_approach, f"{target_key}_app", "approach_target",
+                goal_handle, fast
+            ),
+            lambda: self._move_to(
+                target_joints, target_key, "place", goal_handle, fast
+            ),
+            self._open_gripper,
+            lambda: self._move_to(
+                target_approach, f"{target_key}_app", "approach_target",
+                goal_handle, fast
+            ),
+            lambda: self._move_to(
+                home_joints, "home", "return_home", goal_handle, fast
+            ),
+        ]
+
+        if start_step < 0 or start_step >= len(steps):
+            start_step = 0
+
+        for step_index in range(start_step, len(steps)):
+            self._resume_context = {
+                "mode": "move_piece",
+                "source_slot": source_slot,
+                "target_slot": target_slot,
+                "fast": fast,
+                "next_step": step_index,
+            }
+            self._check_cancel()
+            steps[step_index]()
+
+        self._resume_context = None
+        self.get_logger().info("━━━ Dynamic Move Completed ━━━")
+
+    @staticmethod
+    def _slot_to_position_key(slot: str) -> str:
+        try:
+            zone, raw_index = slot.rsplit("_", 1)
+            index = int(raw_index)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid slot name '{slot}'") from exc
+
+        if zone == "board" and 0 <= index <= 8:
+            return f"cell_{index}"
+        if zone == "storage1" and 0 <= index <= 4:
+            return f"pick_stock_{index + 1}_X"
+        if zone == "storage2" and 0 <= index <= 4:
+            return f"pick_stock_{index + 1}"
+        raise RuntimeError(f"Unsupported slot name '{slot}'")
 
     # ─────────────────────────────────────── helpers
 
@@ -438,6 +607,7 @@ class RobotController(Node):
         self._cancel_requested.clear()
         try:
             self._move_to(home_joints, "home", "return_home", goal_handle=None)
+            self._stock_index = {"X": 1, "O": 1}
             self._publish_status("IDLE")
         except Exception as e:
             self.get_logger().error(f"go_home failed: {e}")

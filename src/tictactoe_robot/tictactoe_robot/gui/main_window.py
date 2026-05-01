@@ -12,6 +12,10 @@ Emergency stop:
   • EmergencyDialog.restart → node.go_home_and_reset()
                               bridge.reset_completed closes MainWindow
                               and relaunches SetupDialog
+
+Finished match:
+  • MatchFinishedDialog.restart → node.collect_board_and_reset()
+                                  collect board pieces, go home, relaunch setup
 """
 
 import math
@@ -135,7 +139,7 @@ class EmergencyDialog(QDialog):
         # ── info note ──────────────────────────────────────────────────
         note = QLabel(
             "Resume: the robot continues from the step where it was interrupted.\n"
-            "Restart: the robot returns home and the game is reconfigured."
+            "Restart: the robot only returns home; board pieces are not collected."
         )
         note.setFont(QFont("JetBrains Mono", 8))
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -256,7 +260,7 @@ class MatchFinishedDialog(QDialog):
         root.addLayout(btn_row)
 
         note = QLabel(
-            "Restart sends the robot home and opens the setup screen.\n"
+            "Restart collects board pieces into storage, then opens setup.\n"
             "Shut Down exits the GUI and shuts down the ROS 2 process."
         )
         note.setFont(QFont("JetBrains Mono", 8))
@@ -494,6 +498,8 @@ class MainWindow(QMainWindow):
         bridge.emergency_confirmed.connect(self._on_emergency_confirmed)
         bridge.original_frame_ready.connect(self._on_original_frame)
         bridge.rectified_frame_ready.connect(self._on_rectified_frame)
+        bridge.vision_warning_changed.connect(self._board.set_vision_warning)
+        bridge.vision_provisional_move.connect(self._board.on_vision_provisional_move)
         # reset_completed is handled in main() to keep the active window alive.
 
         # ── board signals ──────────────────────────────────────────────
@@ -546,7 +552,7 @@ class MainWindow(QMainWindow):
         if dlg.choice == "resume":
             self._do_resume()
         elif dlg.choice == "restart":
-            self._do_restart()
+            self._do_emergency_restart()
 
     def _do_resume(self):
         """
@@ -554,12 +560,21 @@ class MainWindow(QMainWindow):
         """
         self._node.resume_after_emergency()
 
-    def _do_restart(self):
+    def _do_emergency_restart(self):
         """
-        Restart: send the robot home, close this window, and reopen SetupDialog.
+        Emergency restart: do not collect pieces. Send the robot home, close
+        this window, and reopen SetupDialog.
         """
         self._board._status_bar.set_turn("🏠 Returning home...", _YELLOW)
         self._node.go_home_and_reset()
+
+    def _do_finished_match_restart(self):
+        """
+        Finished-match restart: collect board pieces into the detected storage
+        holes, then go home and reopen SetupDialog.
+        """
+        self._board._status_bar.set_turn("🧹 Collecting board pieces...", _YELLOW)
+        self._node.collect_board_and_reset()
 
     def _do_shutdown(self):
         app = QApplication.instance()
@@ -577,7 +592,7 @@ class MainWindow(QMainWindow):
         self._match_finished_dialog_open = False
 
         if dlg.choice == "restart":
-            self._do_restart()
+            self._do_finished_match_restart()
         elif dlg.choice == "shutdown":
             self._do_shutdown()
 
@@ -593,6 +608,8 @@ class MainWindow(QMainWindow):
             self._bridge.emergency_confirmed.disconnect(self._on_emergency_confirmed)
             self._bridge.original_frame_ready.disconnect(self._on_original_frame)
             self._bridge.rectified_frame_ready.disconnect(self._on_rectified_frame)
+            self._bridge.vision_warning_changed.disconnect(self._board.set_vision_warning)
+            self._bridge.vision_provisional_move.disconnect(self._board.on_vision_provisional_move)
             # reset_completed is handled in main()
         except RuntimeError:
             pass

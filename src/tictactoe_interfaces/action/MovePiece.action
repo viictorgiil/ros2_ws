@@ -1,0 +1,20 @@
+# Move one physical piece between explicit board/storage slots.
+#
+# Slot names:
+#   board_0..board_8
+#   storage1_0..storage1_4   # X storage
+#   storage2_0..storage2_4   # O storage
+
+string source_slot
+string target_slot
+bool fast
+
+---
+
+bool success
+string message
+
+---
+
+string phase
+int32 waypoint

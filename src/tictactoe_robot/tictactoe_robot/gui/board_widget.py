@@ -193,7 +193,7 @@ class RobotStatusBar(QFrame):
             color, dot_color = _YELLOW, _YELLOW
         elif status_upper.startswith("MOVING"):
             color, dot_color = _BLUE, _BLUE
-        elif status_upper == "EMERGENCY_STOP":
+        elif status_upper in ("EMERGENCY_STOP", "VISION_PAUSED"):
             color, dot_color = _RED, _RED
         else:
             color, dot_color = _SUBTEXT, _SUBTEXT
@@ -326,6 +326,21 @@ class BoardWidget(QWidget):
         self._status_bar = RobotStatusBar()
         root.addWidget(self._status_bar)
 
+        self._vision_warning = QLabel("")
+        self._vision_warning.setFont(QFont("JetBrains Mono", 9, QFont.Weight.Bold))
+        self._vision_warning.setWordWrap(True)
+        self._vision_warning.setVisible(False)
+        self._vision_warning.setStyleSheet(f"""
+            QLabel {{
+                color: {_YELLOW};
+                background: {_YELLOW}14;
+                border: 1px solid {_YELLOW}66;
+                border-radius: 8px;
+                padding: 8px 10px;
+            }}
+        """)
+        root.addWidget(self._vision_warning)
+
         # ── board ─────────────────────────────────────────────────────
         board_frame = QFrame()
         board_frame.setStyleSheet(f"""
@@ -409,8 +424,11 @@ class BoardWidget(QWidget):
         self._confirm_btn.setEnabled(False)
         for btn in self._cells:
             if btn.is_empty:
-                btn.setEnabled(True)
-        self._status_bar.set_turn("Your turn ✋", _GREEN)
+                btn.setEnabled(self._teleop)
+        if self._teleop:
+            self._status_bar.set_turn("Your turn ✋", _GREEN)
+        else:
+            self._status_bar.set_turn("Place your piece on the board", _GREEN)
 
         # Hide STOP during the human turn
         self._status_bar.show_stop_button(visible=False)
@@ -451,6 +469,39 @@ class BoardWidget(QWidget):
         self._status_bar.set_turn(f"🤔 Robot thinking... → cell {cell}", _BLUE)
         self._show_active_stop_button()
 
+    def set_vision_warning(self, text: str):
+        self._vision_warning.setText(text)
+        self._vision_warning.setVisible(bool(text))
+
+    def on_vision_provisional_move(self, cell_index: int):
+        if self._teleop or not self._human_turn:
+            return
+
+        if self._pending_cell is not None:
+            prev = self._cells[self._pending_cell]
+            if prev.symbol == self._human_symbol:
+                prev.clear()
+                prev.setEnabled(False)
+
+        self._pending_cell = None
+        self._confirm_btn.setEnabled(False)
+
+        if cell_index < 0:
+            self._status_bar.set_turn("Place your piece on the board", _GREEN)
+            return
+
+        btn = self._cells[cell_index]
+        if not btn.is_empty:
+            return
+
+        self._pending_cell = cell_index
+        btn.set_symbol(self._human_symbol, provisional=True)
+        btn.setEnabled(False)
+        self._confirm_btn.setEnabled(True)
+        self._status_bar.set_turn(
+            f"Vision selected cell {cell_index} — confirm?", _YELLOW
+        )
+
     @property
     def camera(self) -> CameraPlaceholder:
         return self._camera
@@ -459,6 +510,8 @@ class BoardWidget(QWidget):
 
     def _on_cell_clicked(self, idx: int):
         if not self._human_turn:
+            return
+        if not self._teleop:
             return
 
         if self._pending_cell is not None and self._pending_cell != idx:
