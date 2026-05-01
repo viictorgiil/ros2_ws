@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QFrame, QSizePolicy,
 )
 from PyQt6.QtCore  import pyqtSignal, Qt
-from PyQt6.QtGui   import QFont
+from PyQt6.QtGui   import QFont, QImage, QPixmap
 
 
 # ─────────────────────────────────────── palette
@@ -228,6 +228,7 @@ class CameraPlaceholder(QFrame):
         super().__init__()
         self.setMinimumHeight(200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._last_pixmap: QPixmap | None = None
         self.setStyleSheet(f"""
             QFrame {{
                 background: #0d0d1a;
@@ -252,15 +253,38 @@ class CameraPlaceholder(QFrame):
         self._placeholder_lbl.setStyleSheet(f"color: {_SUBTEXT}; border: none;")
         layout.addWidget(self._placeholder_lbl)
 
-    def update_frame(self, pixmap):
+    def _refresh_pixmap(self):
+        if self._last_pixmap is None:
+            self._cam_label.clear()
+            self._placeholder_lbl.show()
+            return
+
         self._placeholder_lbl.hide()
+        size = self._cam_label.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+
         self._cam_label.setPixmap(
-            pixmap.scaled(
-                self._cam_label.size(),
+            self._last_pixmap.scaled(
+                size,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+    def update_frame(self, image):
+        if isinstance(image, QImage):
+            pixmap = QPixmap.fromImage(image)
+        else:
+            pixmap = image
+
+        self._last_pixmap = pixmap
+        self._placeholder_lbl.hide()
+        self._refresh_pixmap()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_pixmap()
 
 
 # ─────────────────────────────────────── BoardWidget

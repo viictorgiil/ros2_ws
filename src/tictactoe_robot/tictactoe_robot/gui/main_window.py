@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui  import QFont, QColor, QPainter, QPen, QBrush
 
-from tictactoe_robot.gui.board_widget import BoardWidget
+from tictactoe_robot.gui.board_widget import BoardWidget, CameraPlaceholder
 from tictactoe_robot.gui.setup_widget import SetupDialog
 
 
@@ -465,6 +465,17 @@ class MainWindow(QMainWindow):
         # ── teleoperation tab (placeholder) ───────────────────────────
         teleop_tab = QWidget()
         teleop_tab.setStyleSheet("background: #11111b;")
+        teleop_layout = QVBoxLayout(teleop_tab)
+        teleop_layout.setContentsMargins(16, 12, 16, 12)
+        teleop_layout.setSpacing(10)
+
+        teleop_header = QLabel("// ORIGINAL VIEW")
+        teleop_header.setFont(QFont("JetBrains Mono", 8, QFont.Weight.Bold))
+        teleop_header.setStyleSheet(f"color: {_SUBTEXT};")
+        teleop_layout.addWidget(teleop_header)
+
+        self._teleop_camera = CameraPlaceholder()
+        teleop_layout.addWidget(self._teleop_camera)
         self._tabs.addTab(teleop_tab, "🕹️  Teleoperation")
 
         # ── log tab (placeholder) ─────────────────────────────────────
@@ -481,6 +492,8 @@ class MainWindow(QMainWindow):
         bridge.human_turn_started.connect(self._board.on_human_turn_started)
         bridge.robot_placing_human.connect(self._board.on_robot_placing_human)
         bridge.emergency_confirmed.connect(self._on_emergency_confirmed)
+        bridge.original_frame_ready.connect(self._on_original_frame)
+        bridge.rectified_frame_ready.connect(self._on_rectified_frame)
         # reset_completed is handled in main() to keep the active window alive.
 
         # ── board signals ──────────────────────────────────────────────
@@ -506,6 +519,12 @@ class MainWindow(QMainWindow):
             teleop=teleop,
         )
         self._node.start_game(symbol, difficulty, teleop, ai_starts)
+
+    def _on_original_frame(self, image):
+        self._teleop_camera.update_frame(image)
+
+    def _on_rectified_frame(self, image):
+        self._board.camera.update_frame(image)
 
     # ── internal slots ─────────────────────────────────────────────────
 
@@ -572,6 +591,8 @@ class MainWindow(QMainWindow):
             self._bridge.human_turn_started.disconnect(self._board.on_human_turn_started)
             self._bridge.robot_placing_human.disconnect(self._board.on_robot_placing_human)
             self._bridge.emergency_confirmed.disconnect(self._on_emergency_confirmed)
+            self._bridge.original_frame_ready.disconnect(self._on_original_frame)
+            self._bridge.rectified_frame_ready.disconnect(self._on_rectified_frame)
             # reset_completed is handled in main()
         except RuntimeError:
             pass

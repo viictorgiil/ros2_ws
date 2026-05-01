@@ -14,9 +14,11 @@
   <!-- Dependencias principales -->
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
 
   <!-- TU paquete de interfaces -->
   <depend>tictactoe_interfaces</depend>
+  <exec_depend>tictactoe_vision</exec_depend>
 
   <!-- Optional but common -->
   <exec_depend>python3</exec_depend>

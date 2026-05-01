@@ -29,15 +29,19 @@ from rclpy.node            import Node
 from rclpy.action          import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_msgs.msg          import String
+from sensor_msgs.msg       import Image
 from tictactoe_interfaces.action import PlacePiece
 from tictactoe_robot.tictactoe_game import TicTacToe
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore    import QObject, pyqtSignal
+from PyQt6.QtGui     import QImage
 
 from tictactoe_robot.gui.main_window import launch_app
 
 PLACE_PIECE_ACTION = "/robot_controller/place_piece"
+ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
+RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
 
 
 class RosSignalBridge(QObject):
@@ -49,6 +53,8 @@ class RosSignalBridge(QObject):
     robot_placing_human  = pyqtSignal()
     emergency_confirmed  = pyqtSignal()   # emitted immediately when STOP is pressed
     reset_completed      = pyqtSignal()
+    original_frame_ready  = pyqtSignal(object)
+    rectified_frame_ready = pyqtSignal(object)
 
 
 class GameNode(Node):
@@ -89,6 +95,19 @@ class GameNode(Node):
 
         self._place_client = ActionClient(
             self, PlacePiece, PLACE_PIECE_ACTION, callback_group=cbg
+        )
+
+        self.create_subscription(
+            Image,
+            ORIGINAL_VIEW_TOPIC,
+            self._original_frame_callback,
+            10,
+        )
+        self.create_subscription(
+            Image,
+            RECTIFIED_VIEW_TOPIC,
+            self._rectified_frame_callback,
+            10,
         )
 
         ready = self._place_client.wait_for_server(timeout_sec=5.0)
@@ -298,6 +317,35 @@ class GameNode(Node):
 
     def _status_callback(self, msg: String):
         self._bridge.robot_status_changed.emit(msg.data)
+
+    def _image_to_qimage(self, msg: Image) -> QImage | None:
+        if msg.width == 0 or msg.height == 0 or not msg.data:
+            return None
+
+        if msg.encoding not in ("bgr8", "rgb8"):
+            self.get_logger().warning(
+                f"Unsupported image encoding '{msg.encoding}', skipping frame."
+            )
+            return None
+
+        image = QImage(
+            bytes(msg.data),
+            msg.width,
+            msg.height,
+            msg.step,
+            QImage.Format.Format_BGR888 if msg.encoding == "bgr8" else QImage.Format.Format_RGB888,
+        )
+        return image.copy()
+
+    def _original_frame_callback(self, msg: Image):
+        image = self._image_to_qimage(msg)
+        if image is not None:
+            self._bridge.original_frame_ready.emit(image)
+
+    def _rectified_frame_callback(self, msg: Image):
+        image = self._image_to_qimage(msg)
+        if image is not None:
+            self._bridge.rectified_frame_ready.emit(image)
 
     # ── movement sequences ─────────────────────────────────────────────
 

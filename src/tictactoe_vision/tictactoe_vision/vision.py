@@ -6,6 +6,9 @@ import json
 import time
 import numpy as np
 import mediapipe as mp
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
 
 # ── Connections ─────────────────────────────────────────────────────────────────
 #CAM_HOST    = '0.0.0.0'
@@ -37,6 +40,8 @@ homography  = None
 M_rotation  = None
 detection_failures = 0
 MAX_FAILURES = 3
+ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
+RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
 
 
 # ── Green marker detection ──────────────────────────────────────────────────────
@@ -322,6 +327,34 @@ def draw_hand_warning(frame):
     return frame
 
 
+class FramePublisher(Node):
+    def __init__(self):
+        super().__init__("vision_frame_publisher")
+        self._original_pub = self.create_publisher(Image, ORIGINAL_VIEW_TOPIC, 10)
+        self._rectified_pub = self.create_publisher(Image, RECTIFIED_VIEW_TOPIC, 10)
+
+    def _publish_frame(self, publisher, frame):
+        if frame is None:
+            return
+
+        frame = np.ascontiguousarray(frame)
+        msg = Image()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "camera"
+        msg.height, msg.width = frame.shape[:2]
+        msg.encoding = "bgr8"
+        msg.is_bigendian = 0
+        msg.step = frame.strides[0]
+        msg.data = frame.tobytes()
+        publisher.publish(msg)
+
+    def publish_original(self, frame):
+        self._publish_frame(self._original_pub, frame)
+
+    def publish_rectified(self, frame):
+        self._publish_frame(self._rectified_pub, frame)
+
+
 # ── MediaPipe ───────────────────────────────────────────────────────────────────
 
 base_options = mp.tasks.BaseOptions(model_asset_path=str(Path(__file__).with_name('hand_landmarker.task')))
@@ -419,10 +452,22 @@ def main():
     bridge_sock.connect((BRIDGE_HOST, BRIDGE_PORT))
     print("Bridge OK")
 
+    rclpy.init()
+    frame_pub = FramePublisher()
+
     last_state = None
     cells_s1, cells_board, cells_s2 = get_todas_cells()
     RECALC_CADA = 30
     frame_count  = 0
+
+    def publish_rectified_placeholder(source_frame, text):
+        if source_frame is None:
+            preview = np.zeros((RECT_H, RECT_W, 3), dtype=np.uint8)
+        else:
+            preview = cv2.resize(source_frame, (RECT_W, RECT_H))
+        cv2.putText(preview, text, (18, RECT_H // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 180, 255), 2)
+        return preview
 
     try:
         while True:
@@ -437,7 +482,12 @@ def main():
             frame, hand = draw_hands(frame)
 
             if hand:
-                cv2.imshow("Original View", draw_hand_warning(frame))
+                original_view = draw_hand_warning(frame.copy())
+                frame_pub.publish_original(original_view)
+                frame_pub.publish_rectified(
+                    publish_rectified_placeholder(frame, "HAND DETECTED - waiting...")
+                )
+                cv2.imshow("Original View", original_view)
                 cv2.waitKey(1)
                 continue
 
@@ -445,7 +495,7 @@ def main():
             if frame_count % RECALC_CADA == 1:
                 calcular_homography(frame)
 
-            cv2.imshow("Original View", frame)
+            original_view = frame.copy()
 
             # Show rotated frame
             if M_rotation is not None:
@@ -454,13 +504,17 @@ def main():
                 cv2.imshow("Rotated Frame", frame_rotated)
             else:
                 frame_rotated = frame
-                cv2.putText(frame, "Searching for green markers...",
+                cv2.putText(original_view, "Searching for green markers...",
                             (15, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
 
             # Check if board is not detected
             if detection_failures >= MAX_FAILURES:
-                draw_board_not_detected(frame)
-                cv2.imshow("Original View", frame)
+                original_view = draw_board_not_detected(original_view)
+                frame_pub.publish_original(original_view)
+                frame_pub.publish_rectified(
+                    publish_rectified_placeholder(frame_rotated, "BOARD NOT DETECTED")
+                )
+                cv2.imshow("Original View", original_view)
                 cv2.waitKey(1)
                 continue
 
@@ -488,11 +542,21 @@ def main():
                 draw_zone(debug, cells_board, res_board, (255, 255, 255))
                 draw_zone(debug, cells_s2, res_s2, (0,   200, 255))
                 cv2.imshow("Rectified View", debug)
+                frame_pub.publish_rectified(debug)
+            else:
+                frame_pub.publish_rectified(
+                    publish_rectified_placeholder(frame_rotated, "SEARCHING FOR BOARD")
+                )
+
+            frame_pub.publish_original(original_view)
+            cv2.imshow("Original View", original_view)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
     finally:
+        frame_pub.destroy_node()
+        rclpy.shutdown()
         detector.close()
         # cam_sock.close()
         # cam_server.close()
