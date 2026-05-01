@@ -379,7 +379,10 @@ def main():
     # cam_sock, addr = cam_server.accept()
     # print(f"Camera connected: {addr}")
     print("Opening camera...")
-    cap = cv2.VideoCapture(0)
+
+    # The path /dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920-video-index0 will continue to point to the correct C920:
+    CAMERA_DEVICE = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920-video-index0"
+    cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
 
     if not cap.isOpened():
         print("Error: camera not opened")
