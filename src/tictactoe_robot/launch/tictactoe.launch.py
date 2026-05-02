@@ -18,7 +18,7 @@ Optional arguments:
 """
 
 from launch                            import LaunchDescription
-from launch.actions                    import DeclareLaunchArgument, LogInfo
+from launch.actions                    import DeclareLaunchArgument, LogInfo, Shutdown
 from launch.conditions                 import IfCondition
 from launch.substitutions             import LaunchConfiguration
 from launch_ros.actions                import Node
@@ -54,6 +54,7 @@ def generate_launch_description():
         # Allows terminal I/O (stdin) to reach the node
         additional_env = {"PYTHONUNBUFFERED": "1"},
         emulate_tty    = True,
+        on_exit         = [Shutdown(reason="game_node exited")],
     )
 
     vision_bridge_node = Node(

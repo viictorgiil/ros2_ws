@@ -42,7 +42,7 @@ DST_CORNERS = np.array([
 homography = None
 M_rotation = None
 detection_failures = 0
-MAX_FAILURES = 3
+MAX_FAILURES = 2
 
 ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
 RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
@@ -94,6 +94,18 @@ def detect_green_markers(frame):
     bl = corners_pts[np.argmax(dif)]
 
     return np.array([tl, tr, br, bl], dtype=np.float32), center
+
+
+def count_green_markers(frame) -> int:
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (62, 93, 77), (87, 255, 255))
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return sum(1 for contour in contours if cv2.contourArea(contour) > 50)
 
 
 # ── Homography ──────────────────────────────────────────────────────────────────
@@ -391,16 +403,42 @@ def draw_hand_warning(frame):
     return frame
 
 
+def draw_status_banner(frame, text):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 50), (0, 80, 140), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.putText(
+        frame,
+        text,
+        (15, 33),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2
+    )
+    return frame
+
+
 class FramePublisher(Node):
     def __init__(self):
         super().__init__("vision_frame_publisher")
         self._original_pub = self.create_publisher(Image, ORIGINAL_VIEW_TOPIC, 10)
         self._rectified_pub = self.create_publisher(Image, RECTIFIED_VIEW_TOPIC, 10)
+        self.game_mode = "IDLE"
         self.robot_turn_active = False
         self.create_subscription(String, GAME_TURN_TOPIC, self._turn_callback, 10)
 
     def _turn_callback(self, msg: String):
-        self.robot_turn_active = msg.data.upper() == "ROBOT"
+        self.game_mode = msg.data.upper()
+        self.robot_turn_active = self.game_mode == "ROBOT"
+
+    @property
+    def game_active(self) -> bool:
+        return self.game_mode in ("ROBOT", "HUMAN")
+
+    @property
+    def startup_view_active(self) -> bool:
+        return self.game_mode == "STARTUP"
 
     def _publish_frame(self, publisher, frame):
         if frame is None:
@@ -486,6 +524,8 @@ def recibir_frame(sock):
 # ── Main ────────────────────────────────────────────────────────────────────────
 
 def main():
+    global detection_failures
+
     print("Opening camera...")
 
     CAMERA_DEVICE = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920-video-index0"
@@ -533,9 +573,11 @@ def main():
 
     cells_s1, cells_board, cells_s2 = get_todas_cells()
 
-    RECALC_CADA = 30
+    RECALC_CADA = 10
     STATE_HEARTBEAT_SEC = 0.5
+    MARKER_LOSS_GRACE_SEC = 2.0
     frame_count = 0
+    marker_loss_since = None
 
     def publish_rectified_placeholder(source_frame, text):
         if source_frame is None:
@@ -553,6 +595,15 @@ def main():
             2
         )
         return preview
+
+    def show_window(name, frame, visible):
+        if visible:
+            cv2.imshow(name, frame)
+            return
+        try:
+            cv2.destroyWindow(name)
+        except cv2.error:
+            pass
 
     def send_bridge_state(state):
         nonlocal last_status_state, last_status_sent_at
@@ -589,30 +640,50 @@ def main():
 
             frame_count += 1
 
+            marker_count = count_green_markers(frame)
             if frame_pub.robot_turn_active:
                 frame, hand = draw_hands(frame)
             else:
                 hand = False
 
             if frame_pub.robot_turn_active:
-                original_view = draw_hand_warning(frame.copy()) if hand else frame.copy()
+                board_visible = marker_count >= 2
+                original_view = frame.copy()
+                if hand:
+                    original_view = draw_hand_warning(original_view)
+                elif not board_visible:
+                    original_view = draw_board_not_detected(original_view)
+                else:
+                    original_view = draw_status_banner(
+                        original_view,
+                        "ROBOT MOVING - board detection paused"
+                    )
 
                 frame_pub.publish_original(original_view)
                 frame_pub.publish_rectified(
                     publish_rectified_placeholder(
                         frame,
                         "HAND DETECTED - waiting..."
-                        if hand else "ROBOT MOVING - board detection paused"
+                        if hand else (
+                            "ROBOT MOVING - board visibility lost"
+                            if not board_visible
+                            else "ROBOT MOVING - board detection paused"
+                        )
                     )
                 )
 
                 send_bridge_state({
                     "board_detection_paused": True,
+                    "board_detected": board_visible,
                     "hand_detected": hand,
-                    "warning": "HAND_DETECTED" if hand else "ROBOT_MOVING",
+                    "marker_count": marker_count,
+                    "warning": "HAND_DETECTED" if hand else (
+                        "BOARD_NOT_DETECTED" if not board_visible else "ROBOT_MOVING"
+                    ),
                 })
 
-                cv2.imshow("Original View", original_view)
+                show_window("Original View", original_view, False)
+                show_window("Rectified View", None, False)
                 cv2.waitKey(1)
                 continue
 
@@ -630,19 +701,33 @@ def main():
                     "warning": "HAND_DETECTED",
                 })
 
-                cv2.imshow("Original View", original_view)
+                show_window("Original View", original_view, False)
+                show_window("Rectified View", None, False)
                 cv2.waitKey(1)
                 continue
 
-            if frame_count % RECALC_CADA == 1:
+            now = time.monotonic()
+            if marker_count < 5:
+                if marker_loss_since is None:
+                    marker_loss_since = now
+                if now - marker_loss_since >= MARKER_LOSS_GRACE_SEC:
+                    detection_failures = MAX_FAILURES
+            elif (
+                homography is None
+                or detection_failures > 0
+                or frame_count % RECALC_CADA == 1
+            ):
+                marker_loss_since = None
                 calcular_homography(frame)
+            else:
+                marker_loss_since = None
+                detection_failures = 0
 
             original_view = frame.copy()
 
             if M_rotation is not None:
                 h_f, w_f = frame.shape[:2]
                 frame_rotated = cv2.warpAffine(frame, M_rotation, (w_f, h_f))
-                cv2.imshow("Rotated Frame", frame_rotated)
             else:
                 frame_rotated = frame
                 cv2.putText(
@@ -660,7 +745,7 @@ def main():
 
                 frame_pub.publish_original(original_view)
                 frame_pub.publish_rectified(
-                    publish_rectified_placeholder(frame_rotated, "BOARD NOT DETECTED")
+                    publish_rectified_placeholder(original_view, "BOARD NOT DETECTED")
                 )
 
                 send_bridge_state({
@@ -669,7 +754,8 @@ def main():
                     "warning": "BOARD_NOT_DETECTED",
                 })
 
-                cv2.imshow("Original View", original_view)
+                show_window("Original View", original_view, frame_pub.startup_view_active)
+                show_window("Rectified View", None, False)
                 cv2.waitKey(1)
                 continue
 
@@ -705,12 +791,12 @@ def main():
                 draw_zone(debug, cells_board, res_board, (255, 255, 255))
                 draw_zone(debug, cells_s2, res_s2, (0, 200, 255))
 
-                cv2.imshow("Rectified View", debug)
+                show_window("Rectified View", debug, False)
                 frame_pub.publish_rectified(debug)
 
             else:
                 frame_pub.publish_rectified(
-                    publish_rectified_placeholder(frame_rotated, "SEARCHING FOR BOARD")
+                    publish_rectified_placeholder(original_view, "SEARCHING FOR BOARD")
                 )
 
                 send_bridge_state({
@@ -720,7 +806,8 @@ def main():
                 })
 
             frame_pub.publish_original(original_view)
-            cv2.imshow("Original View", original_view)
+            show_window("Original View", original_view, False)
+            show_window("Rectified View", None, False)
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break

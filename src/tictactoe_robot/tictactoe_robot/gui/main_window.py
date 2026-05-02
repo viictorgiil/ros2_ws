@@ -440,6 +440,9 @@ class MainWindow(QMainWindow):
         self._ai_symbol    : str  = "O"
         self._teleop       : bool = False
         self._match_finished_dialog_open = False
+        self._game_camera_mode = "rectified"
+        self._last_original_frame = None
+        self._last_rectified_frame = None
 
         self.setWindowTitle("TicTacToe × UR3")
         self.setMinimumSize(560, 820)
@@ -500,6 +503,7 @@ class MainWindow(QMainWindow):
         bridge.rectified_frame_ready.connect(self._on_rectified_frame)
         bridge.vision_warning_changed.connect(self._board.set_vision_warning)
         bridge.vision_provisional_move.connect(self._board.on_vision_provisional_move)
+        bridge.vision_display_mode_changed.connect(self._on_vision_display_mode)
         # reset_completed is handled in main() to keep the active window alive.
 
         # ── board signals ──────────────────────────────────────────────
@@ -527,10 +531,22 @@ class MainWindow(QMainWindow):
         self._node.start_game(symbol, difficulty, teleop, ai_starts)
 
     def _on_original_frame(self, image):
+        self._last_original_frame = image
         self._teleop_camera.update_frame(image)
+        if self._game_camera_mode == "original":
+            self._board.camera.update_frame(image)
 
     def _on_rectified_frame(self, image):
-        self._board.camera.update_frame(image)
+        self._last_rectified_frame = image
+        if self._game_camera_mode == "rectified":
+            self._board.camera.update_frame(image)
+
+    def _on_vision_display_mode(self, mode: str):
+        self._game_camera_mode = mode if mode in ("original", "rectified") else "rectified"
+        if self._game_camera_mode == "original" and self._last_original_frame is not None:
+            self._board.camera.update_frame(self._last_original_frame)
+        elif self._game_camera_mode == "rectified" and self._last_rectified_frame is not None:
+            self._board.camera.update_frame(self._last_rectified_frame)
 
     # ── internal slots ─────────────────────────────────────────────────
 
@@ -574,6 +590,7 @@ class MainWindow(QMainWindow):
         holes, then go home and reopen SetupDialog.
         """
         self._board._status_bar.set_turn("🧹 Collecting board pieces...", _YELLOW)
+        self._board._show_active_stop_button()
         self._node.collect_board_and_reset()
 
     def _do_shutdown(self):
@@ -610,6 +627,7 @@ class MainWindow(QMainWindow):
             self._bridge.rectified_frame_ready.disconnect(self._on_rectified_frame)
             self._bridge.vision_warning_changed.disconnect(self._board.set_vision_warning)
             self._bridge.vision_provisional_move.disconnect(self._board.on_vision_provisional_move)
+            self._bridge.vision_display_mode_changed.disconnect(self._on_vision_display_mode)
             # reset_completed is handled in main()
         except RuntimeError:
             pass
