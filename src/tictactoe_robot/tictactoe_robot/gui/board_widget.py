@@ -447,6 +447,15 @@ class BoardWidget(QWidget):
 
     def on_status_changed(self, status: str):
         self._status_bar.set_robot_status(status)
+        status_upper = status.upper()
+        if (
+            not self._human_turn
+            and (
+                status_upper == "BUSY"
+                or status_upper.startswith("MOVING")
+            )
+        ):
+            self._show_active_stop_button()
 
     def on_human_turn_started(self):
         self.enable_human_turn()

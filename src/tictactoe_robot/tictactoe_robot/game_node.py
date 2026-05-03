@@ -34,8 +34,10 @@ from sensor_msgs.msg       import Image
 from tictactoe_interfaces.action import MovePiece, PlacePiece
 from tictactoe_robot.tictactoe_game import TicTacToe
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
-from PyQt6.QtCore    import QObject, pyqtSignal
+from PyQt6.QtWidgets import (
+    QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+)
+from PyQt6.QtCore    import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui     import QImage
 
 from tictactoe_robot.gui.main_window import launch_app
@@ -46,6 +48,112 @@ ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
 RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
 VISION_STATE_TOPIC = "/tictactoe/tablero"
 GAME_TURN_TOPIC = "/tictactoe/game/turn"
+HUMAN_VISION_STABLE_SEC = 2.0
+
+
+class BlockingChoiceDialog(QDialog):
+    def __init__(self, title: str, message: str, buttons: list[tuple[str, str]]):
+        super().__init__(None)
+        self.choice = ""
+        self._allow_close = False
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(520)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 22)
+        root.setSpacing(16)
+
+        label = QLabel(message)
+        label.setWordWrap(True)
+        root.addWidget(label)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        for text, value in buttons:
+            button = QPushButton(text)
+            button.setMinimumWidth(100)
+            button.clicked.connect(lambda _, v=value: self._choose(v))
+            row.addWidget(button)
+        root.addLayout(row)
+
+    def _choose(self, value: str):
+        self.choice = value
+        self._allow_close = True
+        self.accept()
+
+    def reject(self):
+        if self._allow_close:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self._allow_close:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+
+class RobotOperationDialog(QDialog):
+    stop_requested = pyqtSignal()
+
+    def __init__(self, title: str, message: str):
+        super().__init__(None)
+        self._allow_close = False
+        self.setWindowTitle(title)
+        self.setModal(False)
+        self.setMinimumWidth(520)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 22)
+        root.setSpacing(14)
+
+        self._message = QLabel(message)
+        self._message.setWordWrap(True)
+        root.addWidget(self._message)
+
+        self._status = QLabel("Robot: BUSY")
+        root.addWidget(self._status)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        self._stop_button = QPushButton("STOP")
+        self._stop_button.setMinimumWidth(120)
+        self._stop_button.clicked.connect(self._on_stop)
+        row.addWidget(self._stop_button)
+        root.addLayout(row)
+
+    def _on_stop(self):
+        self._stop_button.setEnabled(False)
+        self._stop_button.setText("Stopping...")
+        self.stop_requested.emit()
+
+    def set_status(self, status: str):
+        self._status.setText(f"Robot: {status}")
+        status_upper = status.upper()
+        if status_upper == "BUSY" or status_upper.startswith("MOVING"):
+            self.reset_stop_button()
+
+    def reset_stop_button(self):
+        self._stop_button.setText("STOP")
+        self._stop_button.setEnabled(True)
+
+    def finish(self):
+        self._allow_close = True
+        self.accept()
+
+    def reject(self):
+        if self._allow_close:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self._allow_close:
+            super().closeEvent(event)
+        else:
+            event.ignore()
 
 
 class RosSignalBridge(QObject):
@@ -106,9 +214,14 @@ class GameNode(Node):
         self._vision_candidate_cell: int | None = None
         self._vision_candidate_since = 0.0
         self._vision_pending_cell: int | None = None
+        self._vision_pending_fingerprint: tuple | None = None
+        self._human_vision_change_fingerprint: tuple | None = None
+        self._human_vision_change_since = 0.0
         self._last_vision_warning = ""
         self._last_vision_display_mode = ""
         self._startup_sort_declined = False
+        self._startup_operation_dialog: RobotOperationDialog | None = None
+        self._robot_home_confirmed = False
         self._robot_motion_active = False
         self._use_dynamic_piece_sources = False
         self._piece_source_slots: dict[str, list[str]] = {"X": [], "O": []}
@@ -235,6 +348,16 @@ class GameNode(Node):
                 return
             with self._vision_lock:
                 state = dict(self._vision_state or {})
+            if (
+                self._vision_pending_fingerprint is not None
+                and self._vision_fingerprint(state)
+                != self._vision_pending_fingerprint
+            ):
+                self._reject_human_vision_move(
+                    "The physical state changed after vision selected your "
+                    "move. Hold the correct state still until vision confirms it again."
+                )
+                return
             board = state.get("board") or []
             if len(board) != 9 or board[cell_index] != self._game.human_player:
                 self._reject_human_vision_move(
@@ -357,17 +480,33 @@ class GameNode(Node):
         threading.Thread(target=self._do_collect_board_and_home, daemon=True).start()
 
     def prepare_robot_home_before_startup(self):
-        QMessageBox.warning(
-            None,
+        if self._robot_home_confirmed or not self._place_client.server_is_ready():
+            return
+
+        already_home = self._ask_startup_question(
+            "Robot Home Check",
+            "Is the robot already in the HOME position?\n\n"
+            "Choose Yes only if the robot is safely at HOME. Choose No if it "
+            "must move to HOME before vision startup checks.",
+            yes_text="Yes",
+            no_text="No",
+            default_yes=True,
+        )
+        if already_home:
+            self._robot_home_confirmed = True
+            return
+
+        self._show_startup_warning(
             "Robot Homing",
             "The robot will move to HOME before vision startup checks.\n\n"
             "Stay clear of the robot. Movement starts 2 seconds after you "
-            "close this message.",
+            "click OK.",
         )
         time.sleep(2.0)
         self._publish_vision_mode("ROBOT")
         self._do_go_home(emit_reset=False)
         self._publish_vision_mode("IDLE")
+        self._robot_home_confirmed = True
 
     # ── resume logic ───────────────────────────────────────────────────
 
@@ -540,17 +679,23 @@ class GameNode(Node):
             and not state.get("board_detected", True)
             and (self._robot_motion_active or (self._ai_turn and self._game_started))
         ):
-            self._set_vision_warning(
-                "Board visibility lost during robot movement. Game paused."
-            )
+            self._set_vision_warning("")
             self._pause_for_vision_loss()
             return
 
         if state["board_detection_paused"]:
+            if (
+                self._paused_for_vision
+                and self._paused_game_started
+                and state.get("board_detected", False)
+                and not state.get("hand_detected", False)
+                and int(state.get("marker_count", 0)) >= 2
+            ):
+                self._resume_after_vision_recovered()
             return
 
         if not state["board_detected"]:
-            self._set_vision_warning("Board not detected. Game paused.")
+            self._set_vision_warning("")
             if self._game_started or self._robot_motion_active:
                 self._pause_for_vision_loss()
             return
@@ -784,8 +929,14 @@ class GameNode(Node):
         self._last_vision_warning = text
         self._bridge.vision_warning_changed.emit(text)
 
+    def _process_qt_events_if_safe(self):
+        app = QApplication.instance()
+        if app is not None and QThread.currentThread() == app.thread():
+            app.processEvents()
+
     def _reject_human_vision_move(self, message: str):
         self._vision_pending_cell = None
+        self._vision_pending_fingerprint = None
         self._vision_candidate_cell = None
         self._vision_candidate_since = 0.0
         self._bridge.vision_provisional_move.emit(-1)
@@ -853,6 +1004,9 @@ class GameNode(Node):
         self._vision_candidate_cell = None
         self._vision_candidate_since = 0.0
         self._vision_pending_cell = None
+        self._vision_pending_fingerprint = None
+        self._human_vision_change_fingerprint = None
+        self._human_vision_change_since = 0.0
         self._bridge.vision_provisional_move.emit(-1)
 
     def _begin_human_turn(self, wait_for_fresh_vision: bool = False):
@@ -933,6 +1087,49 @@ class GameNode(Node):
         base_board = list(baseline.get("board") or self._game.board)
         base_storage1 = list(baseline.get("storage1") or [])
         base_storage2 = list(baseline.get("storage2") or [])
+        fingerprint = (
+            tuple(board),
+            tuple(storage1),
+            tuple(storage2),
+        )
+        baseline_fingerprint = (
+            tuple(base_board),
+            tuple(base_storage1),
+            tuple(base_storage2),
+        )
+        now = time.monotonic()
+        if fingerprint == baseline_fingerprint:
+            self._human_vision_change_fingerprint = None
+            self._human_vision_change_since = 0.0
+        else:
+            if fingerprint != self._human_vision_change_fingerprint:
+                self._human_vision_change_fingerprint = fingerprint
+                self._human_vision_change_since = now
+                if (
+                    self._vision_pending_cell is not None
+                    and self._vision_pending_fingerprint != fingerprint
+                ):
+                    self._vision_pending_cell = None
+                    self._vision_pending_fingerprint = None
+                    self._bridge.vision_provisional_move.emit(-1)
+                self._set_vision_warning(
+                    "Hold the physical state still for vision confirmation..."
+                )
+                return
+
+            if now - self._human_vision_change_since < HUMAN_VISION_STABLE_SEC:
+                if (
+                    self._vision_pending_cell is not None
+                    and self._vision_pending_fingerprint != fingerprint
+                ):
+                    self._vision_pending_cell = None
+                    self._vision_pending_fingerprint = None
+                    self._bridge.vision_provisional_move.emit(-1)
+                self._set_vision_warning(
+                    "Hold the physical state still for vision confirmation..."
+                )
+                return
+
         new_cells = [
             i for i, (before, after) in enumerate(zip(base_board, board))
             if before == " " and after in ("X", "O")
@@ -965,6 +1162,7 @@ class GameNode(Node):
         if not new_cells and not changed_existing and not storage_changes:
             if self._vision_pending_cell is not None:
                 self._vision_pending_cell = None
+                self._vision_pending_fingerprint = None
                 self._bridge.vision_provisional_move.emit(-1)
             self._set_vision_warning("")
             return
@@ -1017,19 +1215,10 @@ class GameNode(Node):
             )
             return
 
-        now = time.monotonic()
-        if self._vision_candidate_cell != cell:
-            self._vision_candidate_cell = cell
-            self._vision_candidate_since = now
-            self._set_vision_warning("Hold the piece still for vision confirmation...")
-            return
-
-        if now - self._vision_candidate_since < 3.0:
-            return
-
         if self._vision_pending_cell != cell:
             self._vision_pending_cell = cell
             self._bridge.vision_provisional_move.emit(cell)
+        self._vision_pending_fingerprint = fingerprint
         self._set_vision_warning(
             f"Vision detected cell {cell}. Confirm the move when ready."
         )
@@ -1215,17 +1404,54 @@ class GameNode(Node):
         return "wait", message
 
     def _show_startup_warning(self, title: str, message: str):
-        QMessageBox.warning(None, title, message)
+        dialog = BlockingChoiceDialog(title, message, [("OK", "ok")])
+        dialog.exec()
 
-    def _ask_startup_question(self, title: str, message: str) -> bool:
-        result = QMessageBox.question(
-            None,
-            title,
-            message,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+    def _ask_startup_question(
+        self,
+        title: str,
+        message: str,
+        yes_text: str = "Yes",
+        no_text: str = "No",
+        default_yes: bool = False,
+    ) -> bool:
+        buttons = (
+            [(yes_text, "yes"), (no_text, "no")]
+            if default_yes
+            else [(no_text, "no"), (yes_text, "yes")]
         )
-        return result == QMessageBox.StandardButton.Yes
+        dialog = BlockingChoiceDialog(title, message, buttons)
+        dialog.exec()
+        return dialog.choice == "yes"
+
+    def _show_robot_operation_dialog(self, title: str, message: str):
+        if self._startup_operation_dialog is not None:
+            self._startup_operation_dialog.reset_stop_button()
+            return
+
+        dialog = RobotOperationDialog(title, message)
+        dialog.stop_requested.connect(self.emergency_stop)
+        self._bridge.robot_status_changed.connect(dialog.set_status)
+        dialog.show()
+        QApplication.processEvents()
+        self._startup_operation_dialog = dialog
+
+    def _close_robot_operation_dialog(self):
+        dialog = self._startup_operation_dialog
+        if dialog is None:
+            return
+        try:
+            self._bridge.robot_status_changed.disconnect(dialog.set_status)
+        except RuntimeError:
+            pass
+        dialog.finish()
+        dialog.deleteLater()
+        QApplication.processEvents()
+        self._startup_operation_dialog = None
+
+    def _reset_robot_operation_stop_button(self):
+        if self._startup_operation_dialog is not None:
+            self._startup_operation_dialog.reset_stop_button()
 
     def _is_sortable_vision_state(self, state: dict) -> bool:
         board = list(state.get("board") or [])
@@ -1255,47 +1481,112 @@ class GameNode(Node):
                 self._startup_sort_declined = True
                 return False
 
+        self._show_robot_operation_dialog(
+            "Robot Sorting Pieces",
+            "The robot is reorganizing the physical pieces using vision.\n\n"
+            "Keep clear of the robot. Press STOP only if movement must stop.",
+        )
         self._bridge.robot_status_changed.emit("BUSY")
-        for attempt in range(30):
-            state = self._wait_for_stable_complete_vision_state(
-                timeout=5.0,
-                stable_for=0.8,
-                require_piece_counts=(5, 5),
-            )
-            if state is None:
-                self.get_logger().warning(
-                    "Waiting for stable vision before planning the next sorting move."
+        try:
+            for attempt in range(30):
+                state = self._wait_for_stable_complete_vision_state(
+                    timeout=5.0,
+                    stable_for=0.8,
+                    require_piece_counts=(5, 5),
                 )
-                continue
+                if state is None:
+                    self.get_logger().warning(
+                        "Waiting for stable vision before planning the next sorting move."
+                    )
+                    continue
 
-            if self._storage_sort_complete(state):
-                self.get_logger().info("Vision-guided sorting complete.")
-                self._bridge.robot_status_changed.emit("IDLE")
-                return True
+                if self._storage_sort_complete(state):
+                    self.get_logger().info("Vision-guided sorting complete.")
+                    self._bridge.robot_status_changed.emit("IDLE")
+                    return True
 
-            move = self._plan_next_sort_move(state)
-            if move is None:
-                self.get_logger().error(
-                    "No valid dynamic sorting move found for current vision state."
+                move = self._plan_next_sort_move(state)
+                if move is None:
+                    self.get_logger().error(
+                        "No valid dynamic sorting move found for current vision state."
+                    )
+                    self._bridge.robot_status_changed.emit("IDLE")
+                    return False
+
+                source_slot, target_slot = move
+                if not self._verify_sort_move_state(
+                    state,
+                    source_slot,
+                    target_slot,
+                ):
+                    self._bridge.robot_status_changed.emit("IDLE")
+                    return False
+                self.get_logger().info(
+                    f"Sorting move {attempt + 1}: {source_slot} -> {target_slot}"
                 )
-                self._bridge.robot_status_changed.emit("IDLE")
-                return False
+                while rclpy.ok():
+                    self._publish_vision_mode("ROBOT")
+                    if self._call_move_piece(source_slot, target_slot, fast=True):
+                        break
 
-            source_slot, target_slot = move
-            self.get_logger().info(
-                f"Sorting move {attempt + 1}: {source_slot} -> {target_slot}"
-            )
-            self._publish_vision_mode("ROBOT")
-            if not self._call_move_piece(source_slot, target_slot):
+                    self._publish_turn_state()
+                    if not (
+                        self._emergency_event.is_set()
+                        or self._vision_paused_event.is_set()
+                    ):
+                        self._bridge.robot_status_changed.emit("IDLE")
+                        return False
+
+                    resume = self._ask_startup_question(
+                        "Sorting Interrupted",
+                        "The robot stopped while reorganizing the pieces.\n\n"
+                        "Remove your hand, restore camera visibility, then choose "
+                        "Resume to continue the same movement. Choose Stop if you "
+                        "prefer to sort the pieces manually.",
+                        yes_text="Resume",
+                        no_text="Stop",
+                        default_yes=True,
+                    )
+                    if not resume:
+                        self._startup_sort_declined = True
+                        self._bridge.robot_status_changed.emit("IDLE")
+                        return False
+
+                    while rclpy.ok():
+                        self._emergency_event.clear()
+                        self._vision_paused_event.clear()
+                        self._paused_for_vision = False
+                        self._interrupted_by_vision = False
+                        self._reset_robot_operation_stop_button()
+                        if (
+                            not self._require_vision
+                            or self._wait_for_robot_turn_visibility(timeout=5.0)
+                        ):
+                            break
+                        retry_visibility = self._ask_startup_question(
+                            "Vision Still Blocked",
+                            "The robot cannot resume yet because a hand is still "
+                            "detected or fewer than 2 green markers are visible.\n\n"
+                            "Try again?",
+                            yes_text="Try Again",
+                            no_text="Stop",
+                            default_yes=True,
+                        )
+                        if not retry_visibility:
+                            self._startup_sort_declined = True
+                            self._bridge.robot_status_changed.emit("IDLE")
+                            return False
+
                 self._publish_turn_state()
                 self._bridge.robot_status_changed.emit("IDLE")
-                return False
-            self._publish_turn_state()
-            self._wait_for_vision_after_move()
+                self._wait_for_vision_after_move()
 
-        self.get_logger().error("Sorting did not converge after 30 moves.")
-        self._bridge.robot_status_changed.emit("IDLE")
-        return False
+            else:
+                self.get_logger().error("Sorting did not converge after 30 moves.")
+                self._bridge.robot_status_changed.emit("IDLE")
+                return False
+        finally:
+            self._close_robot_operation_dialog()
 
     def _has_storage_misplacement(self) -> bool:
         state = self._wait_for_stable_complete_vision_state(
@@ -1352,6 +1643,34 @@ class GameNode(Node):
             return f"storage2_{wrong_s2}", f"board_{empty_board}"
 
         return None
+
+    def _verify_sort_move_state(
+        self,
+        state: dict,
+        source_slot: str,
+        target_slot: str,
+    ) -> bool:
+        source_value = self._slot_value(state, source_slot)
+        target_value = self._slot_value(state, target_slot)
+        if source_value not in ("X", "O"):
+            self.get_logger().error(
+                "Startup sorting stopped before movement: source slot "
+                f"{source_slot} does not contain a piece according to vision "
+                f"({source_value!r})."
+            )
+            return False
+        if target_value != " ":
+            self.get_logger().error(
+                "Startup sorting stopped before movement: target slot "
+                f"{target_slot} is not empty according to vision "
+                f"({target_value!r})."
+            )
+            return False
+        self.get_logger().info(
+            "Verified startup sorting move: "
+            f"{source_slot}={source_value}, {target_slot}=empty."
+        )
+        return True
 
     @staticmethod
     def _first_empty(cells: list[str]) -> int | None:
@@ -1422,6 +1741,11 @@ class GameNode(Node):
             "X": [f"storage1_{i}" for i, cell in enumerate(storage1) if cell == " "],
             "O": [f"storage2_{i}" for i, cell in enumerate(storage2) if cell == " "],
         }
+        all_free_targets = [
+            f"storage1_{i}" for i, cell in enumerate(storage1) if cell == " "
+        ] + [
+            f"storage2_{i}" for i, cell in enumerate(storage2) if cell == " "
+        ]
         board_pieces = [
             (i, symbol) for i, symbol in enumerate(board) if symbol in ("X", "O")
         ]
@@ -1430,18 +1754,42 @@ class GameNode(Node):
             "O": sum(1 for _, symbol in board_pieces if symbol == "O"),
         }
 
-        for symbol in ("X", "O"):
-            if needed[symbol] > len(free_targets[symbol]):
+        strict_collection = all(
+            needed[symbol] <= len(free_targets[symbol]) for symbol in ("X", "O")
+        )
+        if not strict_collection:
+            if len(board_pieces) > len(all_free_targets):
                 self.get_logger().error(
-                    "Cannot plan finished-match restart: "
-                    f"{needed[symbol]} {symbol} pieces on board but only "
-                    f"{len(free_targets[symbol])} empty {symbol} storage holes."
+                    "Cannot plan finished-match restart: not enough empty storage "
+                    "holes to collect the board pieces."
                 )
                 return None
 
+            self.get_logger().warning(
+                "Finished-match restart will collect board pieces into any "
+                "available storage holes because the current storage order is "
+                "misordered. Startup vision will validate the next game."
+            )
+            self._set_vision_warning(
+                "Storage zones are misordered. Collecting board pieces into "
+                "available holes; setup will validate the next game."
+            )
+
         plan: list[tuple[str, str, str]] = []
         for board_index, symbol in board_pieces:
-            target_slot = free_targets[symbol].pop(0)
+            if strict_collection and free_targets[symbol]:
+                target_slot = free_targets[symbol][0]
+            elif free_targets[symbol]:
+                target_slot = free_targets[symbol][0]
+            else:
+                target_slot = all_free_targets[0]
+
+            for targets in free_targets.values():
+                if target_slot in targets:
+                    targets.remove(target_slot)
+            if target_slot in all_free_targets:
+                all_free_targets.remove(target_slot)
+
             plan.append((f"board_{board_index}", target_slot, symbol))
 
         return plan
@@ -1550,7 +1898,8 @@ class GameNode(Node):
         if not hasattr(self, "_turn_pub"):
             return
         msg = String()
-        msg.data = mode
+        storage_layout = "DYNAMIC" if self._use_dynamic_piece_sources else "DEFAULT"
+        msg.data = f"{mode}:{storage_layout}"
         self._turn_pub.publish(msg)
 
     # ── movement sequences ─────────────────────────────────────────────
@@ -1865,6 +2214,7 @@ class GameNode(Node):
                     if self._vision_paused_event.is_set():
                         self._interrupted_by_vision = True
                     return False
+                self._process_qt_events_if_safe()
                 time.sleep(0.05)
             return not self._emergency_event.is_set() and not self._vision_paused_event.is_set()
 
@@ -1889,6 +2239,7 @@ class GameNode(Node):
                 if self._vision_paused_event.is_set():
                     self._interrupted_by_vision = True
                 return False
+            self._process_qt_events_if_safe()
             time.sleep(0.05)
 
         gh = send_future.result()
@@ -1916,6 +2267,7 @@ class GameNode(Node):
                 if self._vision_paused_event.is_set():
                     self._interrupted_by_vision = True
                 return False
+            self._process_qt_events_if_safe()
             time.sleep(0.05)
 
         with self._goal_lock:
@@ -1983,6 +2335,7 @@ class GameNode(Node):
                     if self._vision_paused_event.is_set():
                         self._interrupted_by_vision = True
                     return False
+                self._process_qt_events_if_safe()
                 time.sleep(0.05)
             return (
                 not self._emergency_event.is_set()
@@ -2010,6 +2363,7 @@ class GameNode(Node):
                 if self._vision_paused_event.is_set():
                     self._interrupted_by_vision = True
                 return False
+            self._process_qt_events_if_safe()
             time.sleep(0.05)
 
         gh = send_future.result()
@@ -2035,6 +2389,7 @@ class GameNode(Node):
                 if self._vision_paused_event.is_set():
                     self._interrupted_by_vision = True
                 return False
+            self._process_qt_events_if_safe()
             time.sleep(0.05)
 
         with self._goal_lock:
@@ -2070,11 +2425,6 @@ def main(args=None):
 
     node.prepare_robot_home_before_startup()
     node._publish_vision_mode("STARTUP")
-
-    if not node.wait_for_startup_vision():
-        node.destroy_node()
-        rclpy.shutdown()
-        sys.exit(1)
 
     # Keep the current window alive so it is not garbage-collected on reset.
     _current_window: list = [None]

@@ -208,7 +208,6 @@ class RobotController(Node):
 
         # Special goal: return home after an emergency restart
         if symbol == "HOME":
-            self._resume_context = None
             try:
                 self.go_home()
             except Exception as e:
@@ -601,16 +600,118 @@ class RobotController(Node):
 
     # ─────────────────────────────────────── go home (for restart)
 
+    def _context_motion_keys(self, context: dict) -> tuple[str | None, str | None]:
+        mode = context.get("mode")
+        if mode == "place_piece":
+            symbol = str(context.get("symbol", "")).upper()
+            cell_index = int(context.get("cell_index", -1))
+            stock_index = self._stock_index.get(symbol, 1)
+            source_key = (
+                f"pick_stock_{stock_index}" if symbol == "O"
+                else f"pick_stock_{stock_index}_X"
+            )
+            target_key = f"cell_{cell_index}" if 0 <= cell_index <= 8 else None
+            return source_key, target_key
+
+        if mode == "move_piece":
+            return (
+                self._slot_to_position_key(str(context.get("source_slot", ""))),
+                self._slot_to_position_key(str(context.get("target_slot", ""))),
+            )
+
+        return None, None
+
+    @staticmethod
+    def _context_may_hold_piece(context: dict) -> bool:
+        try:
+            next_step = int(context.get("next_step", 0))
+        except (TypeError, ValueError):
+            return False
+
+        # Step 4 closes the gripper; step 8 opens it at the target. If HOME is
+        # requested in this interval, the safest recovery is to finish placing.
+        return 4 <= next_step <= 8
+
+    @staticmethod
+    def _context_near_key(
+        context: dict,
+        source_key: str | None,
+        target_key: str | None,
+    ) -> str | None:
+        try:
+            next_step = int(context.get("next_step", 0))
+        except (TypeError, ValueError):
+            return None
+
+        if 3 <= next_step <= 5:
+            return source_key
+        if 6 <= next_step <= 9:
+            return target_key
+        return None
+
+    def _recover_interrupted_context_before_home(self):
+        context = self._resume_context
+        if not context:
+            return
+
+        try:
+            source_key, target_key = self._context_motion_keys(context)
+            near_key = self._context_near_key(context, source_key, target_key)
+            holding_piece = self._context_may_hold_piece(context)
+
+            if near_key is not None and near_key in self.positions:
+                near_approach = _apply_approach(self.positions[near_key])
+                self._move_to(
+                    near_approach,
+                    f"{near_key}_app",
+                    "safe_lift_before_home",
+                    goal_handle=None,
+                )
+
+            if holding_piece and target_key is not None and target_key in self.positions:
+                self.get_logger().warning(
+                    "HOME requested while the gripper may hold a piece; "
+                    "placing it at the planned target before going home."
+                )
+                target_joints = self.positions[target_key]
+                target_approach = _apply_approach(target_joints)
+                self._move_to(
+                    target_approach,
+                    f"{target_key}_app",
+                    "recover_approach_target",
+                    goal_handle=None,
+                )
+                self._move_to(
+                    target_joints,
+                    target_key,
+                    "recover_place",
+                    goal_handle=None,
+                )
+                self._open_gripper()
+                self._move_to(
+                    target_approach,
+                    f"{target_key}_app",
+                    "recover_leave_target",
+                    goal_handle=None,
+                )
+        except Exception as exc:
+            self.get_logger().warning(
+                f"Could not run interrupted-move recovery before HOME: {exc}"
+            )
+
     def go_home(self):
         """Move the robot home without a PlacePiece goal."""
         home_joints = self.positions["home"]
         self._cancel_requested.clear()
         try:
+            self._recover_interrupted_context_before_home()
             self._move_to(home_joints, "home", "return_home", goal_handle=None)
             self._stock_index = {"X": 1, "O": 1}
+            self._resume_context = None
             self._publish_status("IDLE")
         except Exception as e:
             self.get_logger().error(f"go_home failed: {e}")
+            self._resume_context = None
             self._publish_status("IDLE")
 
 

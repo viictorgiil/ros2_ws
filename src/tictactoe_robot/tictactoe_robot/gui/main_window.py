@@ -644,6 +644,9 @@ def launch_app(bridge, node):
     Show SetupDialog; if accepted, create and show MainWindow.
     Return MainWindow or None if the user closed the dialog.
     """
+    if not node.wait_for_startup_vision():
+        return None
+
     setup = SetupDialog()
 
     result_symbol     : str   = "X"
@@ -662,6 +665,9 @@ def launch_app(bridge, node):
     if not accepted:
         return None
 
+    if not node.wait_for_startup_vision():
+        return None
+
     import random
 
     ai_starts = random.choice([True, False])
@@ -670,6 +676,9 @@ def launch_app(bridge, node):
         human_symbol=result_symbol,
     )
     starter_dialog.exec()
+
+    if not node.wait_for_startup_vision():
+        return None
 
     window = MainWindow(bridge, node)
     window.show()

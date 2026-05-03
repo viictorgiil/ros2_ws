@@ -41,8 +41,11 @@ DST_CORNERS = np.array([
 
 homography = None
 M_rotation = None
+last_marker_reference = None
 detection_failures = 0
 MAX_FAILURES = 2
+CAMERA_MOVE_THRESHOLD_PX = 25.0
+CAMERA_RECALIBRATION_SETTLE_SEC = 1.0
 
 ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
 RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
@@ -51,7 +54,7 @@ GAME_TURN_TOPIC = "/tictactoe/game/turn"
 
 # ── Green marker detection ──────────────────────────────────────────────────────
 
-def detect_green_markers(frame):
+def detect_green_markers(frame, debug=True):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (62, 93, 77), (87, 255, 255))
 
@@ -68,8 +71,9 @@ def detect_green_markers(frame):
             if M['m00'] > 0:
                 centroids.append((M['m10'] / M['m00'], M['m01'] / M['m00']))
 
-    print(f"Green markers detected: {len(centroids)}")
-    cv2.imwrite('/tmp/mask_verde.png', mask)
+    if debug:
+        print(f"Green markers detected: {len(centroids)}")
+        cv2.imwrite('/tmp/mask_verde.png', mask)
 
     if len(centroids) != 5:
         return None, None
@@ -96,6 +100,23 @@ def detect_green_markers(frame):
     return np.array([tl, tr, br, bl], dtype=np.float32), center
 
 
+def marker_reference(corners, center):
+    return np.vstack([corners, np.array([center], dtype=np.float32)])
+
+
+def marker_pose_changed(corners, center) -> bool:
+    if last_marker_reference is None:
+        return False
+
+    current = marker_reference(corners, center)
+    if current.shape != last_marker_reference.shape:
+        return True
+
+    delta = current - last_marker_reference
+    rms = float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
+    return rms >= CAMERA_MOVE_THRESHOLD_PX
+
+
 def count_green_markers(frame) -> int:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (62, 93, 77), (87, 255, 255))
@@ -116,7 +137,7 @@ def calcular_homography(frame):
     2. Rotate frame with that angle → frame_rotated
     3. Detect markers in frame_rotated → calculate H directly on it
     """
-    global homography, M_rotation, detection_failures
+    global homography, M_rotation, last_marker_reference, detection_failures
 
     corners, center = detect_green_markers(frame)
     if corners is None or center is None:
@@ -152,6 +173,7 @@ def calcular_homography(frame):
         H, _ = cv2.findHomography(corners_rot, DST_CORNERS)
         if H is not None:
             homography = H
+            last_marker_reference = marker_reference(corners, center)
             print("  Homography calculated on rotated frame OK")
 
     return corners, center
@@ -326,6 +348,65 @@ def classify_zone(rect, cells):
     return [classify_cell_roi(rect[y1:y2, x1:x2])[0] for (x1, y1, x2, y2) in cells]
 
 
+def classify_all_zones(rect, cells_s1, cells_board, cells_s2):
+    return (
+        classify_zone(rect, cells_s1),
+        classify_zone(rect, cells_board),
+        classify_zone(rect, cells_s2),
+    )
+
+
+def default_storage_score(storage1, storage2):
+    correct = storage1.count('X') + storage2.count('O')
+    wrong = storage1.count('O') + storage2.count('X')
+    return correct - wrong, correct, wrong
+
+
+def classify_default_layout_or_pause(rect, cells_s1, cells_board, cells_s2):
+    """
+    During the normal game layout, storage1 is the X side and storage2 is the
+    O side. If a recalculated homography suddenly makes the storages look
+    swapped, do not publish the frame as a real physical state. Flipping the
+    image would make the display look correct while breaking the robot slot
+    mapping, so the only safe action is to pause and recalibrate.
+    """
+    normal_s1, normal_board, normal_s2 = classify_all_zones(
+        rect,
+        cells_s1,
+        cells_board,
+        cells_s2,
+    )
+    normal_score, normal_correct, normal_wrong = default_storage_score(
+        normal_s1,
+        normal_s2,
+    )
+
+    flipped = cv2.flip(rect, 1)
+    flipped_s1, _, flipped_s2 = classify_all_zones(
+        flipped,
+        cells_s1,
+        cells_board,
+        cells_s2,
+    )
+    flipped_score, flipped_correct, _ = default_storage_score(
+        flipped_s1,
+        flipped_s2,
+    )
+
+    if (
+        normal_wrong > normal_correct
+        and flipped_correct >= 3
+        and flipped_score >= normal_score + 3
+    ):
+        print(
+            "Rejected swapped storage orientation after homography update "
+            f"(normal_score={normal_score}, flipped_score={flipped_score})."
+        )
+        return False, normal_s1, normal_board, normal_s2
+
+    return True, normal_s1, normal_board, normal_s2
+
+
 # ── Visual debug ────────────────────────────────────────────────────────────────
 
 def draw_zone(rect, cells, results, border_color):
@@ -425,11 +506,14 @@ class FramePublisher(Node):
         self._original_pub = self.create_publisher(Image, ORIGINAL_VIEW_TOPIC, 10)
         self._rectified_pub = self.create_publisher(Image, RECTIFIED_VIEW_TOPIC, 10)
         self.game_mode = "IDLE"
+        self.storage_layout = "DEFAULT"
         self.robot_turn_active = False
         self.create_subscription(String, GAME_TURN_TOPIC, self._turn_callback, 10)
 
     def _turn_callback(self, msg: String):
-        self.game_mode = msg.data.upper()
+        parts = msg.data.upper().split(":", 1)
+        self.game_mode = parts[0]
+        self.storage_layout = parts[1] if len(parts) > 1 else "DEFAULT"
         self.robot_turn_active = self.game_mode == "ROBOT"
 
     @property
@@ -439,6 +523,10 @@ class FramePublisher(Node):
     @property
     def startup_view_active(self) -> bool:
         return self.game_mode == "STARTUP"
+
+    @property
+    def default_storage_layout(self) -> bool:
+        return self.storage_layout == "DEFAULT"
 
     def _publish_frame(self, publisher, frame):
         if frame is None:
@@ -524,7 +612,7 @@ def recibir_frame(sock):
 # ── Main ────────────────────────────────────────────────────────────────────────
 
 def main():
-    global detection_failures
+    global homography, M_rotation, last_marker_reference, detection_failures
 
     print("Opening camera...")
 
@@ -578,6 +666,7 @@ def main():
     MARKER_LOSS_GRACE_SEC = 2.0
     frame_count = 0
     marker_loss_since = None
+    camera_recalibrating_until = 0.0
 
     def publish_rectified_placeholder(source_frame, text):
         if source_frame is None:
@@ -712,18 +801,65 @@ def main():
                     marker_loss_since = now
                 if now - marker_loss_since >= MARKER_LOSS_GRACE_SEC:
                     detection_failures = MAX_FAILURES
-            elif (
-                homography is None
-                or detection_failures > 0
-                or frame_count % RECALC_CADA == 1
-            ):
-                marker_loss_since = None
-                calcular_homography(frame)
             else:
                 marker_loss_since = None
-                detection_failures = 0
+                if (
+                    frame_pub.game_active
+                    and homography is not None
+                    and detection_failures == 0
+                ):
+                    corners_live, center_live = detect_green_markers(
+                        frame,
+                        debug=False,
+                    )
+                    if (
+                        corners_live is not None
+                        and center_live is not None
+                        and marker_pose_changed(corners_live, center_live)
+                    ):
+                        print("Camera movement detected; recalibrating homography.")
+                        calcular_homography(frame)
+                        last_state = None
+                        camera_recalibrating_until = (
+                            now + CAMERA_RECALIBRATION_SETTLE_SEC
+                        )
+                elif (
+                    homography is None
+                    or detection_failures > 0
+                    or (
+                        not frame_pub.game_active
+                        and frame_count % RECALC_CADA == 1
+                    )
+                ):
+                    calcular_homography(frame)
+                else:
+                    detection_failures = 0
 
             original_view = frame.copy()
+
+            if now < camera_recalibrating_until:
+                original_view = draw_status_banner(
+                    original_view,
+                    "CAMERA MOVED - recalibrating vision"
+                )
+                frame_pub.publish_original(original_view)
+                frame_pub.publish_rectified(
+                    publish_rectified_placeholder(
+                        frame,
+                        "CAMERA MOVED - RECALIBRATING"
+                    )
+                )
+                send_bridge_state({
+                    "board_detection_paused": True,
+                    "board_detected": False,
+                    "hand_detected": False,
+                    "marker_count": marker_count,
+                    "warning": "CAMERA_RECALIBRATING",
+                })
+                show_window("Original View", original_view, False)
+                show_window("Rectified View", None, False)
+                cv2.waitKey(1)
+                continue
 
             if M_rotation is not None:
                 h_f, w_f = frame.shape[:2]
@@ -762,9 +898,49 @@ def main():
             rect = rectify(frame_rotated)
 
             if rect is not None:
-                res_s1 = classify_zone(rect, cells_s1)
-                res_board = classify_zone(rect, cells_board)
-                res_s2 = classify_zone(rect, cells_s2)
+                if frame_pub.default_storage_layout:
+                    layout_ok, res_s1, res_board, res_s2 = (
+                        classify_default_layout_or_pause(
+                            rect,
+                            cells_s1,
+                            cells_board,
+                            cells_s2,
+                        )
+                    )
+                    if not layout_ok:
+                        original_view = draw_status_banner(
+                            original_view,
+                            "STORAGE ORIENTATION INVALID - recalibrating"
+                        )
+                        debug = rect.copy()
+                        draw_zone_lines(debug)
+                        draw_zone(debug, cells_s1, res_s1, (0, 200, 255))
+                        draw_zone(debug, cells_board, res_board, (255, 255, 255))
+                        draw_zone(debug, cells_s2, res_s2, (0, 200, 255))
+                        frame_pub.publish_original(original_view)
+                        frame_pub.publish_rectified(debug)
+                        send_bridge_state({
+                            "board_detection_paused": True,
+                            "board_detected": False,
+                            "hand_detected": False,
+                            "marker_count": marker_count,
+                            "warning": "STORAGE_ORIENTATION_INVALID",
+                        })
+                        homography = None
+                        M_rotation = None
+                        last_marker_reference = None
+                        detection_failures = MAX_FAILURES
+                        show_window("Original View", original_view, frame_pub.startup_view_active)
+                        show_window("Rectified View", None, False)
+                        cv2.waitKey(1)
+                        continue
+                else:
+                    res_s1, res_board, res_s2 = classify_all_zones(
+                        rect,
+                        cells_s1,
+                        cells_board,
+                        cells_s2,
+                    )
 
                 estado = {
                     "board": res_board,
