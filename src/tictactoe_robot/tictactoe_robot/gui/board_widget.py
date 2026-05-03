@@ -445,6 +445,12 @@ class BoardWidget(QWidget):
         btn.set_symbol(symbol, provisional=False)
         btn.lock()
 
+    def clear_board_cell(self, cell_index: int):
+        if 0 <= cell_index < len(self._cells):
+            btn = self._cells[cell_index]
+            btn.clear()
+            btn.setEnabled(False)
+
     def on_status_changed(self, status: str):
         self._status_bar.set_robot_status(status)
         status_upper = status.upper()

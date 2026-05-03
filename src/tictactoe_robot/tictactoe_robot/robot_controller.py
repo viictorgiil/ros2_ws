@@ -67,6 +67,8 @@ UR3_JOINTS = [
 SIM_WAYPOINT_TIME = 0.5
 FAST_SIM_WAYPOINT_TIME = 0.25
 SIM_GRIPPER_TIME  = 0.1
+UR_CANCEL_SETTLE_TIMEOUT = 3.0
+UR_RESULT_TIMEOUT_MARGIN = 20.0
 
 
 # ─────────────────────────────────────────────────────────────── helpers
@@ -167,7 +169,7 @@ class RobotController(Node):
         # Active goal currently executing
         self._active_goal_handle = None
         self._cancel_requested   = threading.Event()
-        self._resume_context: dict[str, int | str] | None = None
+        self._resume_context: dict[str, int | str | bool] | None = None
 
         self.get_logger().info(
             "RobotController ready. Action servers ~/place_piece and "
@@ -210,8 +212,21 @@ class RobotController(Node):
         if symbol == "HOME":
             try:
                 self.go_home()
+            except _EmergencyStop:
+                self.get_logger().warn("HOME interrupted by emergency.")
+                self._publish_status("EMERGENCY_STOP")
+                goal_handle.canceled()
+                result.success = False
+                result.message = "Emergency stop activated during HOME"
+                self._active_goal_handle = None
+                return result
             except Exception as e:
                 self.get_logger().error(f"go_home failed: {e}")
+                goal_handle.abort()
+                result.success = False
+                result.message = str(e)
+                self._active_goal_handle = None
+                return result
             goal_handle.succeed()
             result.success = True
             result.message = "Robot at home"
@@ -322,11 +337,16 @@ class RobotController(Node):
 
     # ─────────────────────────────────────── gripper
 
+    def _mark_context_holding_piece(self, holding: bool):
+        if self._resume_context is not None:
+            self._resume_context["holding_piece"] = holding
+
     def _open_gripper(self):
         if self._cancel_requested.is_set():
             raise _EmergencyStop()
         if self._simulate:
             self.get_logger().info("  🤏 [SIM] Gripper: OPEN")
+            self._mark_context_holding_piece(False)
             self._interruptible_sleep(SIM_GRIPPER_TIME)
             return
 
@@ -336,6 +356,7 @@ class RobotController(Node):
         req.state = 0.0
         self._io_client.call_async(req)
         self.get_logger().info("  🤏 Gripper: OPEN")
+        self._mark_context_holding_piece(False)
         self._interruptible_sleep(GRIPPER_WAIT)
 
     def _close_gripper(self):
@@ -343,6 +364,7 @@ class RobotController(Node):
             raise _EmergencyStop()
         if self._simulate:
             self.get_logger().info("  🤏 [SIM] Gripper: CLOSED")
+            self._mark_context_holding_piece(True)
             self._interruptible_sleep(SIM_GRIPPER_TIME)
             return
 
@@ -352,6 +374,7 @@ class RobotController(Node):
         req.state = 1.0
         self._io_client.call_async(req)
         self.get_logger().info("  🤏 Gripper: CLOSED")
+        self._mark_context_holding_piece(True)
         self._interruptible_sleep(GRIPPER_WAIT)
 
     # ─────────────────────────────────────── movement
@@ -398,11 +421,26 @@ class RobotController(Node):
         result_future = ur_goal_handle.get_result_async()
 
         # Wait for the result while checking cancellation
+        result_started_at = time.monotonic()
+        result_timeout = waypoint_time + UR_RESULT_TIMEOUT_MARGIN
         while not result_future.done():
             if self._cancel_requested.is_set():
                 # Also cancel the UR3 goal
-                ur_goal_handle.cancel_goal_async()
+                self._cancel_ur_goal_and_wait(
+                    ur_goal_handle,
+                    result_future,
+                    label,
+                )
                 raise _EmergencyStop()
+            if time.monotonic() - result_started_at > result_timeout:
+                self._cancel_ur_goal_and_wait(
+                    ur_goal_handle,
+                    result_future,
+                    label,
+                )
+                raise RuntimeError(
+                    f"Timed out waiting for trajectory result toward '{label}'"
+                )
             time.sleep(0.05)
 
         result = result_future.result()
@@ -413,6 +451,29 @@ class RobotController(Node):
             )
 
         self.get_logger().info(f"  ✅ Reached '{label}'")
+
+    def _cancel_ur_goal_and_wait(self, ur_goal_handle, result_future, label: str):
+        self.get_logger().warning(
+            f"  ⛔ Cancelling UR trajectory toward '{label}' and waiting for settle."
+        )
+        try:
+            cancel_future = ur_goal_handle.cancel_goal_async()
+            deadline = time.monotonic() + UR_CANCEL_SETTLE_TIMEOUT
+            while not cancel_future.done() and time.monotonic() < deadline:
+                time.sleep(0.05)
+        except Exception as exc:
+            self.get_logger().warning(
+                f"  Could not request UR trajectory cancellation cleanly: {exc}"
+            )
+
+        deadline = time.monotonic() + UR_CANCEL_SETTLE_TIMEOUT
+        while result_future is not None and not result_future.done():
+            if time.monotonic() >= deadline:
+                self.get_logger().warning(
+                    f"  UR trajectory toward '{label}' did not settle before timeout."
+                )
+                return
+            time.sleep(0.05)
 
     # ─────────────────────────────────────── pick-and-place
 
@@ -623,15 +684,17 @@ class RobotController(Node):
 
     @staticmethod
     def _context_may_hold_piece(context: dict) -> bool:
+        if "holding_piece" in context:
+            return bool(context.get("holding_piece", False))
+
         try:
             next_step = int(context.get("next_step", 0))
         except (TypeError, ValueError):
             return False
 
-        # Step 4 closes the gripper; step 8 opens it at the target. If HOME is
-        # requested in this interval, return the piece to its source before
-        # going home so emergency restart preserves the physical board state.
-        return 4 <= next_step <= 8
+        # Fallback for old contexts: only after the close-gripper step has
+        # completed can we assume a piece may be held.
+        return 5 <= next_step <= 8
 
     @staticmethod
     def _context_near_key(
@@ -646,14 +709,12 @@ class RobotController(Node):
 
         if 3 <= next_step <= 5:
             return source_key
-        if 6 <= next_step <= 9:
-            return target_key
         return None
 
-    def _recover_interrupted_context_before_home(self):
+    def _recover_interrupted_context_before_home(self) -> bool:
         context = self._resume_context
         if not context:
-            return
+            return False
 
         try:
             source_key, target_key = self._context_motion_keys(context)
@@ -670,7 +731,12 @@ class RobotController(Node):
                 )
 
             recovery_key = source_key
-            if holding_piece and recovery_key is not None and recovery_key in self.positions:
+            if holding_piece and (
+                recovery_key is None or recovery_key not in self.positions
+            ):
+                return False
+
+            if holding_piece:
                 self.get_logger().warning(
                     "HOME requested while the gripper may hold a piece; "
                     "returning it to the source slot before going home."
@@ -696,21 +762,32 @@ class RobotController(Node):
                     "recover_leave_source",
                     goal_handle=None,
                 )
+                return True
+            return True
+        except _EmergencyStop:
+            raise
         except Exception as exc:
             self.get_logger().warning(
                 f"Could not run interrupted-move recovery before HOME: {exc}"
             )
+            return False
 
     def go_home(self):
         """Move the robot home without a PlacePiece goal."""
         home_joints = self.positions["home"]
         self._cancel_requested.clear()
         try:
-            self._recover_interrupted_context_before_home()
+            if self._recover_interrupted_context_before_home():
+                # Once recovery has returned/released the piece, the old move
+                # must not be replayed if HOME is interrupted afterwards.
+                self._resume_context = None
             self._move_to(home_joints, "home", "return_home", goal_handle=None)
             self._stock_index = {"X": 1, "O": 1}
             self._resume_context = None
             self._publish_status("IDLE")
+        except _EmergencyStop:
+            self._publish_status("EMERGENCY_STOP")
+            raise
         except Exception as e:
             self.get_logger().error(f"go_home failed: {e}")
             self._resume_context = None

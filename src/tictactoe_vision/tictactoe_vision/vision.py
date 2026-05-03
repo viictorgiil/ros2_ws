@@ -45,6 +45,8 @@ last_marker_reference = None
 detection_failures = 0
 MAX_FAILURES = 2
 CAMERA_MOVE_THRESHOLD_PX = 25.0
+CAMERA_MOVE_CONFIRM_SEC = 0.8
+CAMERA_MOVE_CONFIRM_FRAMES = 8
 CAMERA_RECALIBRATION_SETTLE_SEC = 1.0
 
 ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
@@ -680,6 +682,8 @@ def main():
     frame_count = 0
     marker_loss_since = None
     camera_recalibrating_until = 0.0
+    camera_move_candidate_since = None
+    camera_move_candidate_frames = 0
 
     def publish_rectified_placeholder(source_frame, text):
         if source_frame is None:
@@ -810,6 +814,8 @@ def main():
 
             now = time.monotonic()
             if marker_count < 5:
+                camera_move_candidate_since = None
+                camera_move_candidate_frames = 0
                 if marker_loss_since is None:
                     marker_loss_since = now
                 if frame_pub.game_active:
@@ -853,12 +859,29 @@ def main():
                         and center_live is not None
                         and marker_pose_changed(corners_live, center_live)
                     ):
-                        print("Camera movement detected; recalibrating homography.")
-                        calcular_homography(frame)
-                        last_state = None
-                        camera_recalibrating_until = (
-                            now + CAMERA_RECALIBRATION_SETTLE_SEC
-                        )
+                        if camera_move_candidate_since is None:
+                            camera_move_candidate_since = now
+                            camera_move_candidate_frames = 1
+                        else:
+                            camera_move_candidate_frames += 1
+
+                        if (
+                            now - camera_move_candidate_since >= CAMERA_MOVE_CONFIRM_SEC
+                            and camera_move_candidate_frames >= CAMERA_MOVE_CONFIRM_FRAMES
+                        ):
+                            print(
+                                "Camera movement confirmed; recalibrating homography."
+                            )
+                            calcular_homography(frame)
+                            last_state = None
+                            camera_recalibrating_until = (
+                                now + CAMERA_RECALIBRATION_SETTLE_SEC
+                            )
+                            camera_move_candidate_since = None
+                            camera_move_candidate_frames = 0
+                    else:
+                        camera_move_candidate_since = None
+                        camera_move_candidate_frames = 0
                 elif (
                     homography is None
                     or detection_failures > 0
@@ -966,10 +989,6 @@ def main():
                             "marker_count": marker_count,
                             "warning": "STORAGE_ORIENTATION_INVALID",
                         })
-                        homography = None
-                        M_rotation = None
-                        last_marker_reference = None
-                        detection_failures = MAX_FAILURES
                         show_window("Original View", original_view, False)
                         show_window("Rectified View", None, False)
                         cv2.waitKey(1)

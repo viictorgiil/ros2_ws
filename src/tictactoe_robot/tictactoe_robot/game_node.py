@@ -112,6 +112,7 @@ class RobotOperationDialog(QDialog):
     def __init__(self, title: str, message: str):
         super().__init__(None)
         self._allow_close = False
+        self._stop_in_progress = False
         self.setWindowTitle(title)
         self.setModal(False)
         self.setMinimumWidth(520)
@@ -138,6 +139,9 @@ class RobotOperationDialog(QDialog):
         root.addLayout(row)
 
     def _on_stop(self):
+        if self._stop_in_progress:
+            return
+        self._stop_in_progress = True
         self._stop_button.setEnabled(False)
         self._stop_button.setText("Stopping...")
         self.stop_requested.emit()
@@ -145,10 +149,14 @@ class RobotOperationDialog(QDialog):
     def set_status(self, status: str):
         self._status.setText(f"Robot: {status}")
         status_upper = status.upper()
-        if status_upper == "BUSY" or status_upper.startswith("MOVING"):
+        if (
+            not self._stop_in_progress
+            and (status_upper == "BUSY" or status_upper.startswith("MOVING"))
+        ):
             self.reset_stop_button()
 
     def reset_stop_button(self):
+        self._stop_in_progress = False
         self._stop_button.setText("STOP")
         self._stop_button.setEnabled(True)
 
@@ -181,6 +189,7 @@ class RosSignalBridge(QObject):
     vision_warning_changed = pyqtSignal(str)
     vision_provisional_move = pyqtSignal(int)
     vision_display_mode_changed = pyqtSignal(str)
+    board_cell_cleared = pyqtSignal(int)
 
 
 class GameNode(Node):
@@ -231,6 +240,7 @@ class GameNode(Node):
         self._last_vision_warning = ""
         self._last_vision_display_mode = ""
         self._startup_sort_declined = False
+        self._startup_shutdown_requested = False
         self._startup_operation_dialog: RobotOperationDialog | None = None
         self._robot_home_confirmed = False
         self._robot_motion_active = False
@@ -241,6 +251,11 @@ class GameNode(Node):
         self._restart_collection_interrupted = False
         self._restart_collection_plan: list[tuple[str, str, str]] = []
         self._restart_collection_next_index = 0
+        self._resume_lock = threading.Lock()
+        self._resume_in_progress = False
+        self._home_motion_active = False
+        self._home_motion_interrupted = False
+        self._home_motion_emit_reset = True
         self._joint_state_lock = threading.Lock()
         self._last_joint_state: dict[str, float] = {}
         self._last_joint_state_at = 0.0
@@ -476,6 +491,10 @@ class GameNode(Node):
         self.get_logger().warn("⛔ emergency_stop() activated.")
         self._game_started = False
         self._emergency_event.set()
+        if self._restart_collection_active:
+            self._restart_collection_interrupted = True
+        if self._home_motion_active:
+            self._home_motion_interrupted = True
 
         # Cancel the action-server goal asynchronously
         with self._goal_lock:
@@ -495,33 +514,110 @@ class GameNode(Node):
         If _move_was_completed is True, only continue game logic.
         If False, retry the interrupted physical move.
         """
+        with self._resume_lock:
+            if self._resume_in_progress:
+                self.get_logger().warning("Resume already in progress.")
+                return
+            self._resume_in_progress = True
+
+        threading.Thread(
+            target=self._resume_after_emergency_worker,
+            daemon=True,
+        ).start()
+
+    def _finish_resume_attempt(self):
+        with self._resume_lock:
+            self._resume_in_progress = False
+
+    def _resume_after_emergency_worker(self):
+        try:
+            self._resume_after_emergency_impl()
+        finally:
+            self._finish_resume_attempt()
+
+    def _wait_for_motion_stop_before_resume(self, timeout: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and rclpy.ok():
+            with self._goal_lock:
+                has_active_goal = self._active_goal_handle is not None
+            if not self._robot_motion_active and not has_active_goal:
+                return True
+            time.sleep(0.05)
+
+        self._set_vision_warning(
+            "Cannot resume yet: the previous robot goal is still stopping."
+        )
+        return False
+
+    def _resume_after_emergency_impl(self):
+        if not self._wait_for_motion_stop_before_resume():
+            return
+
+        if self._home_motion_interrupted:
+            self._emergency_event.clear()
+            self._vision_paused_event.clear()
+            self._paused_for_vision = False
+            self._vision_pause_expected_board = None
+            self._interrupted_by_vision = False
+            self._bridge.robot_status_changed.emit("VISION_PAUSED")
+            if self._require_vision and not self._wait_for_robot_turn_visibility(
+                timeout=None,
+                pause_on_timeout=False,
+            ):
+                return
+            self._bridge.robot_status_changed.emit("BUSY")
+            emit_reset = self._home_motion_emit_reset
+            self._home_motion_interrupted = False
+            self._do_go_home(emit_reset=emit_reset)
+            return
+
         if self._restart_collection_interrupted:
             self._emergency_event.clear()
             self._vision_paused_event.clear()
+            self._paused_for_vision = False
+            self._vision_pause_expected_board = None
+            self._interrupted_by_vision = False
+            self._bridge.robot_status_changed.emit("VISION_PAUSED")
             if self._require_vision and not self._wait_for_robot_turn_visibility(
-                timeout=2.5
+                timeout=None,
+                pause_on_timeout=False,
             ):
                 return
-            threading.Thread(
-                target=self._resume_restart_collection,
-                daemon=True,
-            ).start()
+            self._bridge.robot_status_changed.emit("BUSY")
+            self._resume_restart_collection()
             return
 
-        self._game_started = True
         self._emergency_event.clear()
-        if self._require_vision and not self._teleop:
-            if self._ai_turn and not self._move_was_completed:
-                if not self._wait_for_robot_turn_visibility(timeout=2.5):
-                    return
-            else:
-                expected_board = list(self._game.board)
-                if not self._wait_for_expected_board_or_pause(
-                    expected_board,
-                    "Restore the board to the exact state before resuming.",
-                    timeout=2.0,
+        self._vision_paused_event.clear()
+        self._paused_for_vision = False
+        self._vision_pause_expected_board = None
+
+        if self._require_vision:
+            expected_board = (
+                self._expected_board_with_move(
+                    self._pending_cell_idx,
+                    self._pending_symbol,
+                )
+                if self._move_was_completed and not self._move_logic_applied
+                else list(self._game.board)
+            )
+            if (self._ai_turn or self._teleop) and not self._move_was_completed:
+                self._bridge.robot_status_changed.emit("VISION_PAUSED")
+                if not self._wait_for_robot_turn_visibility(
+                    timeout=None,
+                    pause_on_timeout=False,
                 ):
                     return
+            elif not self._wait_for_expected_board_or_pause(
+                expected_board,
+                "Restore the board to the exact state before resuming.",
+                timeout=None,
+                pause_on_timeout=False,
+            ):
+                return
+
+        self._game_started = True
+        self._publish_turn_state()
         self.get_logger().info(
             f"▶ Resuming. move_was_completed={self._move_was_completed} "
             f"move_logic_applied={self._move_logic_applied}"
@@ -547,7 +643,20 @@ class GameNode(Node):
             ).start()
 
     def go_home_and_reset(self):
-        threading.Thread(target=self._do_go_home, daemon=True).start()
+        threading.Thread(target=self._go_home_and_reset_worker, daemon=True).start()
+
+    def _go_home_and_reset_worker(self):
+        if not self._wait_for_motion_stop_before_resume():
+            return
+        if self._require_vision:
+            self._bridge.robot_status_changed.emit("VISION_PAUSED")
+            if not self._wait_for_robot_turn_visibility(
+                timeout=None,
+                pause_on_timeout=False,
+            ):
+                return
+        self._bridge.robot_status_changed.emit("BUSY")
+        self._do_go_home(emit_reset=True)
 
     def collect_board_and_reset(self):
         threading.Thread(target=self._do_collect_board_and_home, daemon=True).start()
@@ -559,8 +668,15 @@ class GameNode(Node):
         self._use_dynamic_piece_sources = False
         self._piece_source_slots = {"X": [], "O": []}
         self._startup_sort_declined = False
+        self._startup_shutdown_requested = False
         self._vision_pending_cell = None
         self._vision_pending_fingerprint = None
+        self._restart_collection_active = False
+        self._restart_collection_interrupted = False
+        self._restart_collection_plan = []
+        self._restart_collection_next_index = 0
+        self._home_motion_active = False
+        self._home_motion_interrupted = False
         self._set_vision_warning("")
         self._publish_turn_state()
 
@@ -793,7 +909,9 @@ class GameNode(Node):
             self._resume_after_vision_recovered()
 
     def _update_vision_display_mode(self, state: dict):
-        if not self._game_started and not self._robot_motion_active:
+        if self._teleop or self._restart_collection_active:
+            mode = "original"
+        elif not self._game_started and not self._robot_motion_active:
             mode = "rectified"
         elif state.get("board_detection_paused", False):
             mode = "original"
@@ -872,16 +990,19 @@ class GameNode(Node):
         self,
         expected_board: list[str],
         warning: str,
-        timeout: float = 5.0,
+        timeout: float | None = 5.0,
+        pause_on_timeout: bool = True,
     ) -> bool:
         if not self._require_vision:
             return True
 
         after = time.monotonic()
         self._publish_vision_mode("IDLE")
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         last_state: dict = {}
-        while time.monotonic() < deadline and rclpy.ok():
+        if timeout is None:
+            self._set_vision_warning(warning)
+        while (deadline is None or time.monotonic() < deadline) and rclpy.ok():
             with self._vision_lock:
                 last_state = dict(self._vision_state or {})
             if (
@@ -897,17 +1018,27 @@ class GameNode(Node):
             time.sleep(0.05)
 
         self._set_vision_warning(warning)
-        self._pause_for_vision_loss(expected_board=expected_board)
+        if pause_on_timeout:
+            self._pause_for_vision_loss(expected_board=expected_board)
         return False
 
-    def _wait_for_robot_turn_visibility(self, timeout: float = 2.5) -> bool:
+    def _wait_for_robot_turn_visibility(
+        self,
+        timeout: float | None = 2.5,
+        pause_on_timeout: bool = True,
+    ) -> bool:
         if not self._require_vision:
             return True
 
         after = time.monotonic()
         self._publish_vision_mode("ROBOT")
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and rclpy.ok():
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if timeout is None:
+            self._set_vision_warning(
+                "Waiting to resume robot motion: remove your hand and keep at "
+                "least 2 green board markers visible."
+            )
+        while (deadline is None or time.monotonic() < deadline) and rclpy.ok():
             with self._vision_lock:
                 state = dict(self._vision_state or {})
 
@@ -928,7 +1059,8 @@ class GameNode(Node):
             "Cannot resume robot turn: remove your hand and keep at least "
             "2 green board markers visible."
         )
-        self._pause_for_vision_loss()
+        if pause_on_timeout:
+            self._pause_for_vision_loss()
         return False
 
     @staticmethod
@@ -1408,6 +1540,8 @@ class GameNode(Node):
         last_message = ""
         last_log = 0.0
         while rclpy.ok():
+            if self._startup_shutdown_requested:
+                return False
             self._publish_vision_mode("STARTUP")
             status, message = self._startup_vision_action()
             if status == "ready":
@@ -1463,6 +1597,8 @@ class GameNode(Node):
                     )
                     time.sleep(2.0)
                     if not self._collect_startup_board_pieces():
+                        if self._startup_shutdown_requested:
+                            return False
                         self.get_logger().warning(
                             "Startup board collection did not complete. "
                             "Waiting for a valid vision state."
@@ -1486,6 +1622,8 @@ class GameNode(Node):
                 )
                 time.sleep(2.0)
                 if not self._sort_pieces_to_storage(prompt_for_misplaced=False):
+                    if self._startup_shutdown_requested:
+                        return False
                     self.get_logger().warning(
                         "Startup sorting did not complete. Fix the board or "
                         "storage state; waiting for a valid vision state."
@@ -1574,6 +1712,86 @@ class GameNode(Node):
         dialog = BlockingChoiceDialog(title, message, buttons)
         dialog.exec()
         return dialog.choice == "yes"
+
+    def _ask_startup_interruption_choice(self, title: str, message: str) -> str:
+        dialog = BlockingChoiceDialog(
+            title,
+            message,
+            [
+                ("Resume Robot", "resume"),
+                ("Collect Manually", "manual"),
+                ("Shut Down", "shutdown"),
+            ],
+        )
+        dialog.exec()
+        return dialog.choice
+
+    def _request_startup_shutdown(self):
+        self._startup_shutdown_requested = True
+        app = QApplication.instance()
+        if app is not None:
+            app.closeAllWindows()
+            app.quit()
+
+    def _return_home_for_startup_manual_cleanup(self):
+        self._show_startup_warning(
+            "Robot Returning Home",
+            "The robot stopped during startup piece handling.\n\n"
+            "It will return to HOME before you collect pieces manually. "
+            "Keep clear until the next message confirms it is safe.",
+        )
+        self._publish_vision_mode("ROBOT")
+        self._do_go_home(emit_reset=False)
+        self._publish_vision_mode("STARTUP")
+        self._emergency_event.clear()
+        self._vision_paused_event.clear()
+        self._paused_for_vision = False
+        self._interrupted_by_vision = False
+        self._startup_sort_declined = False
+        self._bridge.robot_status_changed.emit("IDLE")
+        self._show_startup_warning(
+            "Manual Cleanup Safe",
+            "The robot is at HOME.\n\n"
+            "You can now collect or reorder the pieces manually. After you "
+            "click OK, vision will check again. If pieces remain on the board, "
+            "you can choose robot collection again.",
+        )
+
+    def _handle_startup_interruption(self, title: str, message: str) -> bool:
+        while rclpy.ok() and not self._startup_shutdown_requested:
+            choice = self._ask_startup_interruption_choice(title, message)
+
+            if choice == "shutdown":
+                self._request_startup_shutdown()
+                return False
+
+            if choice == "manual":
+                self._return_home_for_startup_manual_cleanup()
+                return False
+
+            self._emergency_event.clear()
+            self._vision_paused_event.clear()
+            self._paused_for_vision = False
+            self._interrupted_by_vision = False
+            self._reset_robot_operation_stop_button()
+            if (
+                not self._require_vision
+                or self._wait_for_robot_turn_visibility(
+                    timeout=5.0,
+                    pause_on_timeout=False,
+                )
+            ):
+                return True
+
+            title = "Vision Still Blocked"
+            message = (
+                "The robot cannot resume yet because a hand is still detected "
+                "or fewer than 2 green markers are visible.\n\n"
+                "Remove the obstruction, then choose Resume Robot. Choose "
+                "Collect Manually to send the robot home before manual cleanup."
+            )
+
+        return False
 
     def _show_robot_operation_dialog(self, title: str, message: str):
         if self._startup_operation_dialog is not None:
@@ -1688,45 +1906,16 @@ class GameNode(Node):
                         self._bridge.robot_status_changed.emit("IDLE")
                         return False
 
-                    resume = self._ask_startup_question(
+                    if not self._handle_startup_interruption(
                         "Sorting Interrupted",
                         "The robot stopped while reorganizing the pieces.\n\n"
-                        "Remove your hand, restore camera visibility, then choose "
-                        "Resume to continue the same movement. Choose Stop if you "
-                        "prefer to sort the pieces manually.",
-                        yes_text="Resume",
-                        no_text="Stop",
-                        default_yes=True,
-                    )
-                    if not resume:
-                        self._startup_sort_declined = True
+                        "Remove your hand and restore camera visibility, then "
+                        "choose Resume Robot to continue the same movement. "
+                        "Choose Collect Manually if you prefer to sort the "
+                        "pieces yourself after the robot returns HOME.",
+                    ):
                         self._bridge.robot_status_changed.emit("IDLE")
                         return False
-
-                    while rclpy.ok():
-                        self._emergency_event.clear()
-                        self._vision_paused_event.clear()
-                        self._paused_for_vision = False
-                        self._interrupted_by_vision = False
-                        self._reset_robot_operation_stop_button()
-                        if (
-                            not self._require_vision
-                            or self._wait_for_robot_turn_visibility(timeout=5.0)
-                        ):
-                            break
-                        retry_visibility = self._ask_startup_question(
-                            "Vision Still Blocked",
-                            "The robot cannot resume yet because a hand is still "
-                            "detected or fewer than 2 green markers are visible.\n\n"
-                            "Try again?",
-                            yes_text="Try Again",
-                            no_text="Stop",
-                            default_yes=True,
-                        )
-                        if not retry_visibility:
-                            self._startup_sort_declined = True
-                            self._bridge.robot_status_changed.emit("IDLE")
-                            return False
 
                 self._publish_turn_state()
                 self._bridge.robot_status_changed.emit("IDLE")
@@ -1819,43 +2008,14 @@ class GameNode(Node):
             ):
                 return False
 
-            resume = self._ask_startup_question(
+            if not self._handle_startup_interruption(
                 "Startup Movement Interrupted",
                 "The robot stopped while moving a startup piece.\n\n"
-                "Remove your hand, restore camera visibility, then choose "
-                "Resume to continue the same movement. Choose Stop if you "
-                "prefer to finish manually.",
-                yes_text="Resume",
-                no_text="Stop",
-                default_yes=True,
-            )
-            if not resume:
-                self._startup_sort_declined = True
+                "Remove your hand and restore camera visibility, then choose "
+                "Resume Robot to continue the same movement. Choose Collect "
+                "Manually if you prefer to finish after the robot returns HOME.",
+            ):
                 return False
-
-            while rclpy.ok():
-                self._emergency_event.clear()
-                self._vision_paused_event.clear()
-                self._paused_for_vision = False
-                self._interrupted_by_vision = False
-                self._reset_robot_operation_stop_button()
-                if (
-                    not self._require_vision
-                    or self._wait_for_robot_turn_visibility(timeout=5.0)
-                ):
-                    break
-                retry_visibility = self._ask_startup_question(
-                    "Vision Still Blocked",
-                    "The robot cannot resume yet because a hand is still "
-                    "detected or fewer than 2 green markers are visible.\n\n"
-                    "Try again?",
-                    yes_text="Try Again",
-                    no_text="Stop",
-                    default_yes=True,
-                )
-                if not retry_visibility:
-                    self._startup_sort_declined = True
-                    return False
 
         return False
 
@@ -2122,6 +2282,15 @@ class GameNode(Node):
         value = str(cells[index]).upper()
         return value if value in ("X", "O") else " "
 
+    def _emit_board_cell_cleared_for_slot(self, slot: str):
+        try:
+            zone, raw_index = slot.rsplit("_", 1)
+            index = int(raw_index)
+        except ValueError:
+            return
+        if zone == "board" and 0 <= index <= 8:
+            self._bridge.board_cell_cleared.emit(index)
+
     def _verify_collection_move_before_start(
         self,
         plan: list[tuple[str, str, str]],
@@ -2191,6 +2360,8 @@ class GameNode(Node):
             return
         if not self._game_started:
             self._publish_vision_mode("IDLE")
+        elif self._teleop:
+            self._publish_vision_mode("ROBOT")
         elif self._ai_turn:
             self._publish_vision_mode("ROBOT")
         else:
@@ -2208,46 +2379,108 @@ class GameNode(Node):
 
     def _do_go_home(self, emit_reset: bool = True):
         self.get_logger().info("🏠 Sending robot home...")
+        self._home_motion_active = True
+        self._home_motion_interrupted = False
+        self._home_motion_emit_reset = emit_reset
+        self._robot_motion_active = True
+        self._publish_vision_mode("ROBOT")
 
-        # Clear the emergency event so the HOME goal is not blocked.
-        self._emergency_event.clear()
+        try:
+            # Clear the emergency event so the HOME goal can be sent. If a hand
+            # is still visible, vision will set it again before movement
+            # continues for long.
+            self._emergency_event.clear()
 
-        if not self._place_client.server_is_ready():
-            time.sleep(1.0)
-            if emit_reset:
-                self._bridge.reset_completed.emit()
-            return
+            if not self._place_client.server_is_ready():
+                for _ in range(20):
+                    if (
+                        self._emergency_event.is_set()
+                        or self._vision_paused_event.is_set()
+                    ):
+                        self._home_motion_interrupted = True
+                        return
+                    time.sleep(0.05)
+                if emit_reset:
+                    self._bridge.reset_completed.emit()
+                return
 
-        goal = PlacePiece.Goal()
-        goal.symbol     = "HOME"
-        goal.cell_index = -1
+            goal = PlacePiece.Goal()
+            goal.symbol     = "HOME"
+            goal.cell_index = -1
 
-        # The server may still be finishing the previous cancellation.
-        for attempt in range(20):  # up to ~2 seconds
-            future = self._place_client.send_goal_async(goal)
-            while not future.done():
+            gh = None
+            # The server may still be finishing the previous cancellation.
+            for attempt in range(20):  # up to ~2 seconds
+                future = self._place_client.send_goal_async(goal)
+                while not future.done():
+                    if (
+                        self._emergency_event.is_set()
+                        or self._vision_paused_event.is_set()
+                    ):
+                        self._home_motion_interrupted = True
+                        return
+                    time.sleep(0.05)
+
+                gh = future.result()
+                if gh.accepted:
+                    break
+                self.get_logger().warning(
+                    f"HOME goal rejected (attempt {attempt + 1}/20), retrying..."
+                )
+                time.sleep(0.1)
+            else:
+                self.get_logger().error("HOME goal rejected after all attempts.")
+                if emit_reset:
+                    self._bridge.reset_completed.emit()
+                return
+
+            with self._goal_lock:
+                self._active_goal_handle = gh
+
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                gh.cancel_goal_async()
+                self._home_motion_interrupted = True
+                return
+
+            result_future = gh.get_result_async()
+            while not result_future.done():
+                if (
+                    self._emergency_event.is_set()
+                    or self._vision_paused_event.is_set()
+                ):
+                    gh.cancel_goal_async()
+                    self._home_motion_interrupted = True
+                    return
                 time.sleep(0.05)
 
-            gh = future.result()
-            if gh.accepted:
-                break
-            self.get_logger().warning(
-                f"HOME goal rejected (attempt {attempt + 1}/20), retrying..."
-            )
-            time.sleep(0.1)
-        else:
-            self.get_logger().error("HOME goal rejected after all attempts.")
+            from action_msgs.msg import GoalStatus
+
+            result = result_future.result()
+            if result.status == GoalStatus.STATUS_CANCELED:
+                self._home_motion_interrupted = True
+                return
+            if not result.result.success:
+                self.get_logger().error(f"HOME failed: {result.result.message}")
+                self._home_motion_interrupted = bool(
+                    self._emergency_event.is_set()
+                    or self._vision_paused_event.is_set()
+                )
+                return
+
+            self.get_logger().info("🏠 Robot at home.")
+            self._home_motion_interrupted = False
             if emit_reset:
                 self._bridge.reset_completed.emit()
-            return
-
-        result_future = gh.get_result_async()
-        while not result_future.done():
-            time.sleep(0.05)
-
-        self.get_logger().info("🏠 Robot at home.")
-        if emit_reset:
-            self._bridge.reset_completed.emit()
+        finally:
+            with self._goal_lock:
+                self._active_goal_handle = None
+            self._robot_motion_active = False
+            self._home_motion_active = False
+            if self._home_motion_interrupted:
+                self._bridge.robot_status_changed.emit("EMERGENCY_STOP")
+            else:
+                self._bridge.robot_status_changed.emit("IDLE")
+                self._publish_turn_state()
 
     def _do_collect_board_and_home(self):
         self.get_logger().info(
@@ -2294,13 +2527,14 @@ class GameNode(Node):
             self._do_go_home(emit_reset=True)
         else:
             self._restart_collection_active = False
-            self._do_go_home(emit_reset=False)
+            self._do_go_home(emit_reset=True)
 
     def _run_restart_collection_plan(
         self,
         plan: list[tuple[str, str, str]],
         start_index: int,
         verify_current: bool,
+        skip_initial_verification: bool = False,
     ) -> bool | None:
         self.get_logger().info(
             f"Finished-match collection plan has {len(plan)} fixed moves."
@@ -2309,20 +2543,28 @@ class GameNode(Node):
         for move_index in range(start_index, len(plan)):
             source_slot, target_slot, symbol = plan[move_index]
             self._restart_collection_next_index = move_index
-            self._publish_vision_mode("IDLE")
-            fresh_after = time.monotonic()
-            if not self._verify_collection_move_before_start(
-                plan,
-                move_index,
-                fresh_after,
-                verify_next=check_current,
-            ):
-                self._publish_vision_mode("IDLE")
-                self._set_vision_warning(
-                    "Reset collection failed verification. Sending robot home "
-                    "for safety."
+            skip_this_check = skip_initial_verification and move_index == start_index
+            if skip_this_check:
+                self.get_logger().info(
+                    "Skipping full vision verification before resuming the "
+                    "interrupted collection move because the stopped robot may "
+                    "still occlude board markers."
                 )
-                return False
+            else:
+                self._publish_vision_mode("IDLE")
+                fresh_after = time.monotonic()
+                if not self._verify_collection_move_before_start(
+                    plan,
+                    move_index,
+                    fresh_after,
+                    verify_next=check_current,
+                ):
+                    self._publish_vision_mode("IDLE")
+                    self._set_vision_warning(
+                        "Reset collection failed verification. Sending robot home "
+                        "for safety."
+                    )
+                    return False
             check_current = True
 
             self.get_logger().info(
@@ -2349,6 +2591,7 @@ class GameNode(Node):
                 )
                 return False
 
+            self._emit_board_cell_cleared_for_slot(source_slot)
             self._publish_vision_mode("IDLE")
             self._restart_collection_next_index = move_index + 1
 
@@ -2387,6 +2630,7 @@ class GameNode(Node):
             plan,
             start_index=start_index,
             verify_current=False,
+            skip_initial_verification=True,
         )
         if ok is None:
             return
@@ -2399,7 +2643,7 @@ class GameNode(Node):
             self._do_go_home(emit_reset=True)
         else:
             self._restart_collection_active = False
-            self._do_go_home(emit_reset=False)
+            self._do_go_home(emit_reset=True)
 
     def _do_human_teleop_move(self, cell_index: int):
         self._last_human_cell  = cell_index

@@ -504,6 +504,7 @@ class MainWindow(QMainWindow):
         bridge.vision_warning_changed.connect(self._board.set_vision_warning)
         bridge.vision_provisional_move.connect(self._board.on_vision_provisional_move)
         bridge.vision_display_mode_changed.connect(self._on_vision_display_mode)
+        bridge.board_cell_cleared.connect(self._board.clear_board_cell)
         # reset_completed is handled in main() to keep the active window alive.
 
         # ── board signals ──────────────────────────────────────────────
@@ -582,6 +583,7 @@ class MainWindow(QMainWindow):
         this window, and reopen SetupDialog.
         """
         self._board._status_bar.set_turn("🏠 Returning home...", _YELLOW)
+        self._board._show_active_stop_button()
         self._node.go_home_and_reset()
 
     def _do_finished_match_restart(self):
@@ -628,6 +630,7 @@ class MainWindow(QMainWindow):
             self._bridge.vision_warning_changed.disconnect(self._board.set_vision_warning)
             self._bridge.vision_provisional_move.disconnect(self._board.on_vision_provisional_move)
             self._bridge.vision_display_mode_changed.disconnect(self._on_vision_display_mode)
+            self._bridge.board_cell_cleared.disconnect(self._board.clear_board_cell)
             # reset_completed is handled in main()
         except RuntimeError:
             pass
