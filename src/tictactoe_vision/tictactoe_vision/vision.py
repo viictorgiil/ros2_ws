@@ -54,6 +54,29 @@ GAME_TURN_TOPIC = "/tictactoe/game/turn"
 
 # ── Green marker detection ──────────────────────────────────────────────────────
 
+def dist_segmento(p, a, b):
+    ab = b - a
+    t = np.clip(np.dot(p - a, ab) / (np.dot(ab, ab) + 1e-8), 0, 1)
+    return np.linalg.norm((p - a) - t * ab)
+
+
+def order_corners_from_top_marker(corners_pts, top_marker):
+    pairs = []
+    for i in range(len(corners_pts)):
+        for j in range(i + 1, len(corners_pts)):
+            pairs.append((i, j, dist_segmento(top_marker, corners_pts[i], corners_pts[j])))
+
+    top_i, top_j, _ = min(pairs, key=lambda item: item[2])
+    bottom_indices = [i for i in range(len(corners_pts)) if i not in (top_i, top_j)]
+
+    top_pair = sorted([corners_pts[top_i], corners_pts[top_j]], key=lambda p: p[0])
+    bottom_pair = sorted([corners_pts[i] for i in bottom_indices], key=lambda p: p[0])
+
+    tl, tr = top_pair
+    bl, br = bottom_pair
+    return np.array([tl, tr, br, bl], dtype=np.float32)
+
+
 def detect_green_markers(frame, debug=True):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (62, 93, 77), (87, 255, 255))
@@ -80,24 +103,19 @@ def detect_green_markers(frame, debug=True):
 
     pts = np.array(centroids, dtype=np.float32)
 
-    # Central point = minimum maximum distance to the rest
+    # The fifth marker is on the physical top side of the board. In the
+    # calibrated setup it is the point with the smallest maximum distance to
+    # the four corners, and it fixes the physical orientation.
     max_dists = [
         max(np.linalg.norm(pts[i] - pts[j]) for j in range(5) if j != i)
         for i in range(5)
     ]
-    idx_center = int(np.argmin(max_dists))
-    center = pts[idx_center]
-    corners_pts = np.delete(pts, idx_center, axis=0)
+    idx_top_marker = int(np.argmin(max_dists))
+    top_marker = pts[idx_top_marker]
+    corners_pts = np.delete(pts, idx_top_marker, axis=0)
+    ordered = order_corners_from_top_marker(corners_pts, top_marker)
 
-    suma = corners_pts.sum(axis=1)
-    dif = np.diff(corners_pts, axis=1).flatten()
-
-    tl = corners_pts[np.argmin(suma)]
-    br = corners_pts[np.argmax(suma)]
-    tr = corners_pts[np.argmin(dif)]
-    bl = corners_pts[np.argmax(dif)]
-
-    return np.array([tl, tr, br, bl], dtype=np.float32), center
+    return ordered, top_marker
 
 
 def marker_reference(corners, center):
@@ -139,8 +157,8 @@ def calcular_homography(frame):
     """
     global homography, M_rotation, last_marker_reference, detection_failures
 
-    corners, center = detect_green_markers(frame)
-    if corners is None or center is None:
+    corners, top_marker = detect_green_markers(frame)
+    if corners is None or top_marker is None:
         detection_failures += 1
         return None, None
 
@@ -148,18 +166,13 @@ def calcular_homography(frame):
 
     tl, tr, br, bl = corners[0], corners[1], corners[2], corners[3]
 
-    def dist_segmento(p, a, b):
-        ab = b - a
-        t = np.clip(np.dot(p - a, ab) / (np.dot(ab, ab) + 1e-8), 0, 1)
-        return np.linalg.norm((p - a) - t * ab)
-
     edges = [
         ('TL-TR', tl, tr),
         ('TR-BR', tr, br),
         ('BR-BL', br, bl),
         ('BL-TL', bl, tl),
     ]
-    edge_name, pa, pb = min(edges, key=lambda x: dist_segmento(center, x[1], x[2]))
+    edge_name, pa, pb = min(edges, key=lambda x: dist_segmento(top_marker, x[1], x[2]))
     angle_deg = np.degrees(np.arctan2(pb[1] - pa[1], pb[0] - pa[0]))
     print(f"  Edge: {edge_name}, angle={angle_deg:.1f}")
 
@@ -173,10 +186,10 @@ def calcular_homography(frame):
         H, _ = cv2.findHomography(corners_rot, DST_CORNERS)
         if H is not None:
             homography = H
-            last_marker_reference = marker_reference(corners, center)
+            last_marker_reference = marker_reference(corners, top_marker)
             print("  Homography calculated on rotated frame OK")
 
-    return corners, center
+    return corners, top_marker
 
 
 def rectify(frame_rotated):
@@ -799,6 +812,29 @@ def main():
             if marker_count < 5:
                 if marker_loss_since is None:
                     marker_loss_since = now
+                if frame_pub.game_active:
+                    original_view = draw_status_banner(
+                        frame.copy(),
+                        "BOARD MARKERS OCCLUDED - waiting"
+                    )
+                    frame_pub.publish_original(original_view)
+                    frame_pub.publish_rectified(
+                        publish_rectified_placeholder(
+                            frame,
+                            "BOARD MARKERS OCCLUDED - WAITING"
+                        )
+                    )
+                    send_bridge_state({
+                        "board_detection_paused": True,
+                        "board_detected": False,
+                        "hand_detected": False,
+                        "marker_count": marker_count,
+                        "warning": "MARKERS_OCCLUDED",
+                    })
+                    show_window("Original View", original_view, False)
+                    show_window("Rectified View", None, False)
+                    cv2.waitKey(1)
+                    continue
                 if now - marker_loss_since >= MARKER_LOSS_GRACE_SEC:
                     detection_failures = MAX_FAILURES
             else:
@@ -890,7 +926,11 @@ def main():
                     "warning": "BOARD_NOT_DETECTED",
                 })
 
-                show_window("Original View", original_view, frame_pub.startup_view_active)
+                show_window(
+                    "Original View",
+                    original_view,
+                    frame_pub.startup_view_active and marker_count < 5,
+                )
                 show_window("Rectified View", None, False)
                 cv2.waitKey(1)
                 continue
@@ -898,7 +938,7 @@ def main():
             rect = rectify(frame_rotated)
 
             if rect is not None:
-                if frame_pub.default_storage_layout:
+                if frame_pub.game_active and frame_pub.default_storage_layout:
                     layout_ok, res_s1, res_board, res_s2 = (
                         classify_default_layout_or_pause(
                             rect,
@@ -930,7 +970,7 @@ def main():
                         M_rotation = None
                         last_marker_reference = None
                         detection_failures = MAX_FAILURES
-                        show_window("Original View", original_view, frame_pub.startup_view_active)
+                        show_window("Original View", original_view, False)
                         show_window("Rectified View", None, False)
                         cv2.waitKey(1)
                         continue

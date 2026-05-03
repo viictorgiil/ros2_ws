@@ -629,7 +629,8 @@ class RobotController(Node):
             return False
 
         # Step 4 closes the gripper; step 8 opens it at the target. If HOME is
-        # requested in this interval, the safest recovery is to finish placing.
+        # requested in this interval, return the piece to its source before
+        # going home so emergency restart preserves the physical board state.
         return 4 <= next_step <= 8
 
     @staticmethod
@@ -668,30 +669,31 @@ class RobotController(Node):
                     goal_handle=None,
                 )
 
-            if holding_piece and target_key is not None and target_key in self.positions:
+            recovery_key = source_key
+            if holding_piece and recovery_key is not None and recovery_key in self.positions:
                 self.get_logger().warning(
                     "HOME requested while the gripper may hold a piece; "
-                    "placing it at the planned target before going home."
+                    "returning it to the source slot before going home."
                 )
-                target_joints = self.positions[target_key]
-                target_approach = _apply_approach(target_joints)
+                recovery_joints = self.positions[recovery_key]
+                recovery_approach = _apply_approach(recovery_joints)
                 self._move_to(
-                    target_approach,
-                    f"{target_key}_app",
-                    "recover_approach_target",
+                    recovery_approach,
+                    f"{recovery_key}_app",
+                    "recover_approach_source",
                     goal_handle=None,
                 )
                 self._move_to(
-                    target_joints,
-                    target_key,
-                    "recover_place",
+                    recovery_joints,
+                    recovery_key,
+                    "recover_return_piece",
                     goal_handle=None,
                 )
                 self._open_gripper()
                 self._move_to(
-                    target_approach,
-                    f"{target_key}_app",
-                    "recover_leave_target",
+                    recovery_approach,
+                    f"{recovery_key}_app",
+                    "recover_leave_source",
                     goal_handle=None,
                 )
         except Exception as exc:

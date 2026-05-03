@@ -24,15 +24,17 @@ import json
 import sys
 import threading
 import time
+from pathlib import Path
 
 import rclpy
 from rclpy.node            import Node
 from rclpy.action          import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_msgs.msg          import String
-from sensor_msgs.msg       import Image
+from sensor_msgs.msg       import Image, JointState
 from tictactoe_interfaces.action import MovePiece, PlacePiece
 from tictactoe_robot.tictactoe_game import TicTacToe
+from ament_index_python.packages import get_package_share_directory
 
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
@@ -49,6 +51,15 @@ RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
 VISION_STATE_TOPIC = "/tictactoe/tablero"
 GAME_TURN_TOPIC = "/tictactoe/game/turn"
 HUMAN_VISION_STABLE_SEC = 2.0
+HOME_JOINT_TOLERANCE_RAD = 0.08
+UR3_JOINTS = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+]
 
 
 class BlockingChoiceDialog(QDialog):
@@ -230,6 +241,10 @@ class GameNode(Node):
         self._restart_collection_interrupted = False
         self._restart_collection_plan: list[tuple[str, str, str]] = []
         self._restart_collection_next_index = 0
+        self._joint_state_lock = threading.Lock()
+        self._last_joint_state: dict[str, float] = {}
+        self._last_joint_state_at = 0.0
+        self._home_joints = self._load_home_joints()
 
         cbg = ReentrantCallbackGroup()
 
@@ -237,6 +252,12 @@ class GameNode(Node):
             String,
             "/robot_controller/robot_status",
             self._status_callback,
+            10,
+        )
+        self.create_subscription(
+            JointState,
+            "/joint_states",
+            self._joint_state_callback,
             10,
         )
 
@@ -282,6 +303,58 @@ class GameNode(Node):
         self._publish_turn_state()
 
     # ── public API ─────────────────────────────────────────────────────
+
+    def _load_home_joints(self) -> list[float] | None:
+        try:
+            pkg_path = get_package_share_directory("tictactoe_robot")
+            positions_file = Path(pkg_path) / "positions.json"
+        except Exception:
+            positions_file = Path("src/tictactoe_robot/positions.json")
+
+        if not positions_file.exists():
+            positions_file = Path("positions.json")
+
+        try:
+            with open(positions_file) as f:
+                positions = json.load(f)
+            home = positions.get("home")
+            if isinstance(home, list) and len(home) == len(UR3_JOINTS):
+                return [float(value) for value in home]
+        except Exception as exc:
+            self.get_logger().warning(
+                f"Could not load HOME joints for startup check: {exc}"
+            )
+        return None
+
+    def _joint_state_callback(self, msg: JointState):
+        state = {
+            name: float(position)
+            for name, position in zip(msg.name, msg.position)
+        }
+        with self._joint_state_lock:
+            self._last_joint_state = state
+            self._last_joint_state_at = time.monotonic()
+
+    def _robot_is_currently_home(self, timeout: float = 1.0) -> bool:
+        if self._home_joints is None:
+            return False
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and rclpy.ok():
+            with self._joint_state_lock:
+                joint_state = dict(self._last_joint_state)
+                received_at = self._last_joint_state_at
+
+            if time.monotonic() - received_at <= 1.0 and all(
+                joint in joint_state for joint in UR3_JOINTS
+            ):
+                return all(
+                    abs(joint_state[joint] - expected) <= HOME_JOINT_TOLERANCE_RAD
+                    for joint, expected in zip(UR3_JOINTS, self._home_joints)
+                )
+            time.sleep(0.05)
+
+        return False
 
     def start_game(
         self,
@@ -479,20 +552,23 @@ class GameNode(Node):
     def collect_board_and_reset(self):
         threading.Thread(target=self._do_collect_board_and_home, daemon=True).start()
 
+    def prepare_for_setup_restart(self):
+        self._game_started = False
+        self._ai_turn = False
+        self._teleop = False
+        self._use_dynamic_piece_sources = False
+        self._piece_source_slots = {"X": [], "O": []}
+        self._startup_sort_declined = False
+        self._vision_pending_cell = None
+        self._vision_pending_fingerprint = None
+        self._set_vision_warning("")
+        self._publish_turn_state()
+
     def prepare_robot_home_before_startup(self):
         if self._robot_home_confirmed or not self._place_client.server_is_ready():
             return
 
-        already_home = self._ask_startup_question(
-            "Robot Home Check",
-            "Is the robot already in the HOME position?\n\n"
-            "Choose Yes only if the robot is safely at HOME. Choose No if it "
-            "must move to HOME before vision startup checks.",
-            yes_text="Yes",
-            no_text="No",
-            default_yes=True,
-        )
-        if already_home:
+        if self._robot_is_currently_home():
             self._robot_home_confirmed = True
             return
 
@@ -665,6 +741,7 @@ class GameNode(Node):
             return
 
         self._update_vision_display_mode(state)
+        warning_message = self._vision_warning_message(state.get("warning", ""))
 
         if state["hand_detected"] and (
             self._robot_motion_active or (self._ai_turn and self._game_started)
@@ -679,11 +756,12 @@ class GameNode(Node):
             and not state.get("board_detected", True)
             and (self._robot_motion_active or (self._ai_turn and self._game_started))
         ):
-            self._set_vision_warning("")
+            self._set_vision_warning(warning_message)
             self._pause_for_vision_loss()
             return
 
         if state["board_detection_paused"]:
+            self._set_vision_warning(warning_message)
             if (
                 self._paused_for_vision
                 and self._paused_game_started
@@ -695,7 +773,7 @@ class GameNode(Node):
             return
 
         if not state["board_detected"]:
-            self._set_vision_warning("")
+            self._set_vision_warning(warning_message)
             if self._game_started or self._robot_motion_active:
                 self._pause_for_vision_loss()
             return
@@ -730,6 +808,29 @@ class GameNode(Node):
             return
         self._last_vision_display_mode = mode
         self._bridge.vision_display_mode_changed.emit(mode)
+
+    @staticmethod
+    def _vision_warning_message(code: str) -> str:
+        messages = {
+            "CAMERA_RECALIBRATING": (
+                "Camera movement detected. Keep the camera still while vision "
+                "recalibrates."
+            ),
+            "MARKERS_OCCLUDED": (
+                "Board markers are occluded. Move your arm away until all 5 "
+                "green markers are visible."
+            ),
+            "STORAGE_ORIENTATION_INVALID": (
+                "Vision rejected an invalid storage orientation. Keep the "
+                "camera still while it recalibrates."
+            ),
+            "BOARD_NOT_DETECTED": (
+                "Board not detected. Make the green markers visible."
+            ),
+            "SEARCHING_FOR_BOARD": "Searching for the board markers...",
+            "HAND_DETECTED": "Hand detected during robot turn.",
+        }
+        return messages.get(str(code).upper(), "")
 
     @staticmethod
     def _normalise_cells(values, expected_len: int) -> list[str]:
@@ -1284,9 +1385,15 @@ class GameNode(Node):
         o_count = all_cells.count("O")
 
         if x_count != 5 or o_count != 5:
+            if x_count == 0 and o_count == 0:
+                return (
+                    False,
+                    "Vision sees no pieces. Keep the camera still and wait for "
+                    "classification to recover.",
+                )
             return False, f"Expected 5 X and 5 O pieces, detected X={x_count}, O={o_count}."
         if any(cell != " " for cell in board):
-            return False, "Board must be empty before starting the game."
+            return False, "Board contains pieces before starting the game."
         if self._use_dynamic_piece_sources:
             if len(storage1) == 5 and len(storage2) == 5:
                 return True, "Vision startup state accepted with dynamic storage mapping."
@@ -1335,6 +1442,40 @@ class GameNode(Node):
                     "storage2, then click OK to check again.",
                 )
                 continue
+            if status == "board_pieces":
+                self.get_logger().warning(message)
+                robot_collect = self._ask_startup_question(
+                    "Pieces On Board",
+                    "Pieces are visible in the middle board zone before the "
+                    "game starts.\n\nDo you want the robot to collect only "
+                    "those board pieces into available storage holes?\n\n"
+                    "Choose No if you prefer to move the pieces manually.",
+                    yes_text="Yes",
+                    no_text="No",
+                )
+                if robot_collect:
+                    self._show_startup_warning(
+                        "Robot Will Collect Board Pieces",
+                        "Move away from the robot. It will collect only the "
+                        "pieces currently on the board.\n\nIf pieces are still "
+                        "misordered after that, you will be asked whether you "
+                        "want to play with that physical order.",
+                    )
+                    time.sleep(2.0)
+                    if not self._collect_startup_board_pieces():
+                        self.get_logger().warning(
+                            "Startup board collection did not complete. "
+                            "Waiting for a valid vision state."
+                        )
+                        time.sleep(1.0)
+                    continue
+
+                self._show_startup_warning(
+                    "Manual Board Cleanup Required",
+                    "Move all pieces out of the middle board zone yourself, "
+                    "then click OK to check the camera state again.",
+                )
+                continue
             if status == "sort":
                 self.get_logger().warning(message)
                 self._show_startup_warning(
@@ -1380,11 +1521,24 @@ class GameNode(Node):
         storage1 = list(state.get("storage1") or [])
         storage2 = list(state.get("storage2") or [])
         all_cells = board + storage1 + storage2
-        if all_cells.count("X") != 5 or all_cells.count("O") != 5:
+        x_count = all_cells.count("X")
+        o_count = all_cells.count("O")
+        if x_count == 0 and o_count == 0:
+            return "wait", (
+                "Vision sees no pieces. Keep the camera still and wait for "
+                "classification to recover."
+            )
+        if x_count != 5 or o_count != 5:
             return "missing", message
 
         if self._startup_sort_declined:
             return "wait", "Startup sorting was declined by the operator."
+
+        if any(cell in ("X", "O") for cell in board):
+            return (
+                "board_pieces",
+                "Pieces are visible on the board before starting the game.",
+            )
 
         if (
             all(cell == " " for cell in board)
@@ -1415,11 +1569,8 @@ class GameNode(Node):
         no_text: str = "No",
         default_yes: bool = False,
     ) -> bool:
-        buttons = (
-            [(yes_text, "yes"), (no_text, "no")]
-            if default_yes
-            else [(no_text, "no"), (yes_text, "yes")]
-        )
+        del default_yes
+        buttons = [(no_text, "no"), (yes_text, "yes")]
         dialog = BlockingChoiceDialog(title, message, buttons)
         dialog.exec()
         return dialog.choice == "yes"
@@ -1588,6 +1739,126 @@ class GameNode(Node):
         finally:
             self._close_robot_operation_dialog()
 
+    def _collect_startup_board_pieces(self) -> bool:
+        self._show_robot_operation_dialog(
+            "Robot Collecting Board Pieces",
+            "The robot is collecting pieces from the middle board only.\n\n"
+            "Storage pieces will not be reordered in this step.",
+        )
+        self._bridge.robot_status_changed.emit("BUSY")
+        try:
+            for attempt in range(30):
+                state = self._wait_for_stable_complete_vision_state(
+                    timeout=5.0,
+                    stable_for=0.8,
+                    require_piece_counts=(5, 5),
+                )
+                if state is None:
+                    self.get_logger().warning(
+                        "Waiting for stable vision before planning the next "
+                        "board collection move."
+                    )
+                    continue
+
+                if all(cell == " " for cell in state.get("board", [])):
+                    self.get_logger().info("Startup board collection complete.")
+                    self._bridge.robot_status_changed.emit("IDLE")
+                    return True
+
+                move = self._plan_next_startup_board_collection_move(state)
+                if move is None:
+                    self.get_logger().error(
+                        "No valid board collection move found for current "
+                        "startup vision state."
+                    )
+                    self._bridge.robot_status_changed.emit("IDLE")
+                    return False
+
+                source_slot, target_slot = move
+                if not self._verify_sort_move_state(
+                    state,
+                    source_slot,
+                    target_slot,
+                ):
+                    self._bridge.robot_status_changed.emit("IDLE")
+                    return False
+
+                self.get_logger().info(
+                    f"Startup board collection move {attempt + 1}: "
+                    f"{source_slot} -> {target_slot}"
+                )
+                if not self._call_startup_move_with_resume(source_slot, target_slot):
+                    self._bridge.robot_status_changed.emit("IDLE")
+                    return False
+                self._wait_for_vision_after_move()
+
+            self.get_logger().error(
+                "Startup board collection did not converge after 30 moves."
+            )
+            self._bridge.robot_status_changed.emit("IDLE")
+            return False
+        finally:
+            self._publish_turn_state()
+            self._close_robot_operation_dialog()
+
+    def _call_startup_move_with_resume(
+        self,
+        source_slot: str,
+        target_slot: str,
+    ) -> bool:
+        while rclpy.ok():
+            self._publish_vision_mode("ROBOT")
+            if self._call_move_piece(source_slot, target_slot, fast=True):
+                self._publish_turn_state()
+                return True
+
+            self._publish_turn_state()
+            if not (
+                self._emergency_event.is_set()
+                or self._vision_paused_event.is_set()
+            ):
+                return False
+
+            resume = self._ask_startup_question(
+                "Startup Movement Interrupted",
+                "The robot stopped while moving a startup piece.\n\n"
+                "Remove your hand, restore camera visibility, then choose "
+                "Resume to continue the same movement. Choose Stop if you "
+                "prefer to finish manually.",
+                yes_text="Resume",
+                no_text="Stop",
+                default_yes=True,
+            )
+            if not resume:
+                self._startup_sort_declined = True
+                return False
+
+            while rclpy.ok():
+                self._emergency_event.clear()
+                self._vision_paused_event.clear()
+                self._paused_for_vision = False
+                self._interrupted_by_vision = False
+                self._reset_robot_operation_stop_button()
+                if (
+                    not self._require_vision
+                    or self._wait_for_robot_turn_visibility(timeout=5.0)
+                ):
+                    break
+                retry_visibility = self._ask_startup_question(
+                    "Vision Still Blocked",
+                    "The robot cannot resume yet because a hand is still "
+                    "detected or fewer than 2 green markers are visible.\n\n"
+                    "Try again?",
+                    yes_text="Try Again",
+                    no_text="Stop",
+                    default_yes=True,
+                )
+                if not retry_visibility:
+                    self._startup_sort_declined = True
+                    return False
+
+        return False
+
     def _has_storage_misplacement(self) -> bool:
         state = self._wait_for_stable_complete_vision_state(
             timeout=2.0,
@@ -1641,6 +1912,37 @@ class GameNode(Node):
             return f"storage1_{wrong_s1}", f"board_{empty_board}"
         if wrong_s2 is not None and empty_board is not None:
             return f"storage2_{wrong_s2}", f"board_{empty_board}"
+
+        return None
+
+    def _plan_next_startup_board_collection_move(
+        self,
+        state: dict,
+    ) -> tuple[str, str] | None:
+        board = list(state.get("board") or [])
+        storage1 = list(state.get("storage1") or [])
+        storage2 = list(state.get("storage2") or [])
+        if len(board) != 9 or len(storage1) != 5 or len(storage2) != 5:
+            return None
+
+        free_targets = {
+            "X": [f"storage1_{i}" for i, cell in enumerate(storage1) if cell == " "],
+            "O": [f"storage2_{i}" for i, cell in enumerate(storage2) if cell == " "],
+        }
+        all_free_targets = [
+            f"storage1_{i}" for i, cell in enumerate(storage1) if cell == " "
+        ] + [
+            f"storage2_{i}" for i, cell in enumerate(storage2) if cell == " "
+        ]
+
+        for board_index, symbol in enumerate(board):
+            if symbol not in ("X", "O"):
+                continue
+            if free_targets[symbol]:
+                return f"board_{board_index}", free_targets[symbol][0]
+            if all_free_targets:
+                return f"board_{board_index}", all_free_targets[0]
+            return None
 
         return None
 
@@ -2110,7 +2412,9 @@ class GameNode(Node):
         self._bridge.robot_status_changed.emit("BUSY")
         self._bridge.robot_placing_human.emit()
 
+        self._publish_vision_mode("ROBOT")
         ok = self._call_place_piece(self._game.human_player, cell_index)
+        self._publish_vision_mode("IDLE")
         if not ok:
             return   # emergency; resume_after_emergency will continue
 
@@ -2413,6 +2717,7 @@ def main(args=None):
     rclpy.init(args=args)
 
     app    = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     bridge = RosSignalBridge()
     node   = GameNode(bridge)
 
@@ -2441,7 +2746,11 @@ def main(args=None):
             old.deleteLater()
             _current_window[0] = None
 
+        node.prepare_for_setup_restart()
         new_window = launch_app(bridge, node)
+        if new_window is None:
+            app.quit()
+            return
         _current_window[0] = new_window
 
     bridge.reset_completed.connect(_on_reset_completed)
