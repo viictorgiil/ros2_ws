@@ -10,6 +10,7 @@ setup(
         package_name: [
             'hand_landmarker.task',
             'best.pt',
+            'best2.pt',
         ],
     },
     include_package_data=True,

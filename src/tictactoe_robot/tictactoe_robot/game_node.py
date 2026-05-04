@@ -436,9 +436,12 @@ class GameNode(Node):
                 return
             with self._vision_lock:
                 state = dict(self._vision_state or {})
+            if state.get("bad_piece_detected", False):
+                self._reject_human_vision_move(self._bad_piece_message(state))
+                return
             if (
                 self._vision_pending_fingerprint is not None
-                and self._vision_fingerprint(state)
+                and self._vision_fingerprint(state, include_bad_piece=True)
                 != self._vision_pending_fingerprint
             ):
                 self._reject_human_vision_move(
@@ -825,6 +828,15 @@ class GameNode(Node):
             self.get_logger().warning("Ignoring malformed vision state JSON.")
             return
 
+        bad_piece_locations = self._normalise_bad_piece_locations(
+            data.get("bad_piece_locations", [])
+        )
+        if not bad_piece_locations:
+            bad_piece_locations = self._bad_piece_locations_from_raw_state(data)
+        bad_piece_detected = bool(
+            data.get("bad_piece_detected", False)
+        ) or bool(bad_piece_locations)
+
         state = {
             "board_detected": bool(data.get("board_detected", "board" in data)),
             "board_detection_paused": bool(
@@ -838,6 +850,8 @@ class GameNode(Node):
             "board": self._normalise_cells(data.get("board", []), 9),
             "storage1": self._normalise_cells(data.get("storage1", []), 5),
             "storage2": self._normalise_cells(data.get("storage2", []), 5),
+            "bad_piece_detected": bad_piece_detected,
+            "bad_piece_locations": bad_piece_locations,
             "timestamp": float(data.get("timestamp", time.time())),
             "received_at": time.monotonic(),
             "warning": str(data.get("warning", "")),
@@ -961,6 +975,84 @@ class GameNode(Node):
         return cells
 
     @staticmethod
+    def _normalise_bad_piece_locations(values) -> list[dict[str, int | str]]:
+        limits = {"board": 9, "storage1": 5, "storage2": 5}
+        locations: list[dict[str, int | str]] = []
+        if not isinstance(values, list):
+            return locations
+
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            zone = str(value.get("zone", "")).lower()
+            try:
+                index = int(value.get("index", -1))
+            except (TypeError, ValueError):
+                continue
+            if zone in limits and 0 <= index < limits[zone]:
+                locations.append({"zone": zone, "index": index})
+        return locations
+
+    @staticmethod
+    def _bad_piece_locations_from_raw_state(data: dict) -> list[dict[str, int | str]]:
+        locations: list[dict[str, int | str]] = []
+        limits = {"board": 9, "storage1": 5, "storage2": 5}
+        for zone, expected_len in limits.items():
+            values = list(data.get(zone, []))[:expected_len]
+            for index, value in enumerate(values):
+                if str(value).upper() == "BAD_PIECE":
+                    locations.append({"zone": zone, "index": index})
+        return locations
+
+    @staticmethod
+    def _bad_piece_key(state: dict) -> tuple:
+        locations = state.get("bad_piece_locations") or []
+        key = []
+        for location in locations:
+            if not isinstance(location, dict):
+                continue
+            key.append((str(location.get("zone", "")), int(location.get("index", -1))))
+        return tuple(sorted(key))
+
+    @staticmethod
+    def _bad_piece_message(state: dict) -> str:
+        locations = state.get("bad_piece_locations") or []
+        board_cells = [
+            int(location["index"])
+            for location in locations
+            if isinstance(location, dict) and location.get("zone") == "board"
+        ]
+        storage_slots = [
+            f"{location.get('zone')}_{location.get('index')}"
+            for location in locations
+            if isinstance(location, dict) and location.get("zone") != "board"
+        ]
+
+        if board_cells:
+            cells = ", ".join(str(cell) for cell in sorted(board_cells))
+            return (
+                f"Piece placed incorrectly in board cell {cells}. Remove it "
+                "and place one piece flat inside the cell."
+            )
+        if storage_slots:
+            slots = ", ".join(storage_slots)
+            return (
+                f"Piece placed incorrectly in storage slot {slots}. Restore "
+                "the storage piece before continuing."
+            )
+        return (
+            "Piece placed incorrectly. Remove it and place exactly one piece "
+            "flat inside an empty board cell."
+        )
+
+    def _latest_bad_piece_state(self) -> dict | None:
+        with self._vision_lock:
+            state = dict(self._vision_state or {})
+        if state.get("bad_piece_detected", False):
+            return state
+        return None
+
+    @staticmethod
     def _storage_before_after(
         zone: str,
         index: int,
@@ -1064,12 +1156,18 @@ class GameNode(Node):
         return False
 
     @staticmethod
-    def _vision_fingerprint(state: dict) -> tuple:
-        return (
+    def _vision_fingerprint(
+        state: dict,
+        include_bad_piece: bool = False,
+    ) -> tuple:
+        base = (
             tuple(state.get("board") or []),
             tuple(state.get("storage1") or []),
             tuple(state.get("storage2") or []),
         )
+        if include_bad_piece:
+            return (*base, GameNode._bad_piece_key(state))
+        return base
 
     def _wait_for_stable_complete_vision_state(
         self,
@@ -1077,6 +1175,7 @@ class GameNode(Node):
         timeout: float = 5.0,
         stable_for: float = 0.8,
         require_piece_counts: tuple[int, int] | None = None,
+        reject_bad_pieces: bool = False,
     ) -> dict | None:
         deadline = time.monotonic() + timeout
         stable_fingerprint = None
@@ -1097,6 +1196,10 @@ class GameNode(Node):
                 and len(state.get("storage1") or []) == 5
                 and len(state.get("storage2") or []) == 5
             ):
+                if reject_bad_pieces and state.get("bad_piece_detected", False):
+                    time.sleep(0.05)
+                    continue
+
                 if require_piece_counts is not None:
                     all_cells = (
                         list(state.get("board") or [])
@@ -1128,6 +1231,7 @@ class GameNode(Node):
             timeout=3.0,
             stable_for=0.5,
             require_piece_counts=(5, 5),
+            reject_bad_pieces=True,
         )
         if state is None:
             self.get_logger().error(
@@ -1178,6 +1282,8 @@ class GameNode(Node):
     def _current_human_vision_move_is_valid(self, state: dict, cell: int) -> bool:
         baseline = self._vision_baseline_state
         if baseline is None:
+            return False
+        if state.get("bad_piece_detected", False):
             return False
 
         board = list(state.get("board") or [])
@@ -1316,6 +1422,8 @@ class GameNode(Node):
         storage2 = list(state.get("storage2") or [])
         if len(storage1) != 5 or len(storage2) != 5:
             return
+        bad_piece_detected = bool(state.get("bad_piece_detected", False))
+        bad_piece_key = self._bad_piece_key(state)
 
         base_board = list(baseline.get("board") or self._game.board)
         base_storage1 = list(baseline.get("storage1") or [])
@@ -1324,11 +1432,13 @@ class GameNode(Node):
             tuple(board),
             tuple(storage1),
             tuple(storage2),
+            bad_piece_key,
         )
         baseline_fingerprint = (
             tuple(base_board),
             tuple(base_storage1),
             tuple(base_storage2),
+            (),
         )
         now = time.monotonic()
         if fingerprint == baseline_fingerprint:
@@ -1391,6 +1501,10 @@ class GameNode(Node):
         unexpected_storage_changes = [
             change for change in storage_changes if change not in removed_from_storage
         ]
+
+        if bad_piece_detected:
+            self._reject_human_vision_move(self._bad_piece_message(state))
+            return
 
         if not new_cells and not changed_existing and not storage_changes:
             if self._vision_pending_cell is not None:
@@ -1508,6 +1622,8 @@ class GameNode(Node):
             return False, "Waiting for a stable complete board/storage vision frame..."
         if not state.get("board_detected", False):
             return False, "Board not detected. Make the 5 green dots visible."
+        if state.get("bad_piece_detected", False):
+            return False, self._bad_piece_message(state)
 
         board = list(state.get("board") or [])
         storage1 = list(state.get("storage1") or [])
@@ -1553,6 +1669,14 @@ class GameNode(Node):
                     "Missing Pieces",
                     message + "\n\nRestore the missing pieces, then click OK "
                     "to check again.",
+                )
+                continue
+            if status == "bad_piece":
+                self.get_logger().warning(message)
+                self._show_startup_warning(
+                    "Piece Placed Incorrectly",
+                    message + "\n\nFix the physical piece, then click OK "
+                    "to check vision again.",
                 )
                 continue
             if status == "misplaced":
@@ -1658,6 +1782,9 @@ class GameNode(Node):
         board = list(state.get("board") or [])
         storage1 = list(state.get("storage1") or [])
         storage2 = list(state.get("storage2") or [])
+        if state.get("bad_piece_detected", False):
+            return "bad_piece", self._bad_piece_message(state)
+
         all_cells = board + storage1 + storage2
         x_count = all_cells.count("X")
         o_count = all_cells.count("O")
@@ -1862,8 +1989,18 @@ class GameNode(Node):
                     timeout=5.0,
                     stable_for=0.8,
                     require_piece_counts=(5, 5),
+                    reject_bad_pieces=True,
                 )
                 if state is None:
+                    bad_state = self._latest_bad_piece_state()
+                    if bad_state is not None:
+                        message = self._bad_piece_message(bad_state)
+                        self.get_logger().error(
+                            f"Startup sorting stopped: {message}"
+                        )
+                        self._set_vision_warning(message)
+                        self._bridge.robot_status_changed.emit("IDLE")
+                        return False
                     self.get_logger().warning(
                         "Waiting for stable vision before planning the next sorting move."
                     )
@@ -1941,8 +2078,18 @@ class GameNode(Node):
                     timeout=5.0,
                     stable_for=0.8,
                     require_piece_counts=(5, 5),
+                    reject_bad_pieces=True,
                 )
                 if state is None:
+                    bad_state = self._latest_bad_piece_state()
+                    if bad_state is not None:
+                        message = self._bad_piece_message(bad_state)
+                        self.get_logger().error(
+                            f"Startup board collection stopped: {message}"
+                        )
+                        self._set_vision_warning(message)
+                        self._bridge.robot_status_changed.emit("IDLE")
+                        return False
                     self.get_logger().warning(
                         "Waiting for stable vision before planning the next "
                         "board collection move."
@@ -2023,6 +2170,7 @@ class GameNode(Node):
         state = self._wait_for_stable_complete_vision_state(
             timeout=2.0,
             stable_for=0.5,
+            reject_bad_pieces=True,
         ) or {}
         return any(cell == "O" for cell in state.get("storage1", [])) or any(
             cell == "X" for cell in state.get("storage2", [])
@@ -2152,9 +2300,18 @@ class GameNode(Node):
             timeout=5.0,
             stable_for=0.8,
             require_piece_counts=(5, 5),
+            reject_bad_pieces=True,
         )
 
         if not state:
+            bad_state = self._latest_bad_piece_state()
+            if bad_state is not None:
+                message = self._bad_piece_message(bad_state)
+                self.get_logger().error(
+                    f"Cannot plan finished-match restart: {message}"
+                )
+                self._set_vision_warning(message)
+                return None
             self.get_logger().error(
                 "Cannot plan finished-match restart: no stable complete vision "
                 "frame with 5 X and 5 O pieces after entering idle mode."
@@ -2266,6 +2423,7 @@ class GameNode(Node):
             timeout=timeout,
             stable_for=0.8,
             require_piece_counts=(5, 5),
+            reject_bad_pieces=True,
         )
 
     @staticmethod

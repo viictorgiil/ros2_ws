@@ -19,7 +19,7 @@ BRIDGE_PORT = 65432
 # ── YOLO model ──────────────────────────────────────────────────────────────────
 # El archivo debe estar en:
 #   ros2_ws/src/tictactoe_vision/tictactoe_vision/best.pt
-YOLO_MODEL_PATH = str(Path(__file__).with_name('best.pt'))
+YOLO_MODEL_PATH = str(Path(__file__).with_name('best2.pt'))
 yolo_model = YOLO(YOLO_MODEL_PATH)
 
 # ── Rectified dimensions (horizontal: storage1 | board | storage2) ──────────────
@@ -48,6 +48,9 @@ CAMERA_MOVE_THRESHOLD_PX = 25.0
 CAMERA_MOVE_CONFIRM_SEC = 0.8
 CAMERA_MOVE_CONFIRM_FRAMES = 8
 CAMERA_RECALIBRATION_SETTLE_SEC = 1.0
+BAD_PIECE_BLINK_RATE = 15
+_bad_piece_blink_counter = 0
+_bad_piece_blink_visible = True
 
 ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
 RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
@@ -190,6 +193,21 @@ def calcular_homography(frame):
             homography = H
             last_marker_reference = marker_reference(corners, top_marker)
             print("  Homography calculated on rotated frame OK")
+            return corners, top_marker
+
+    # A marker can be lost by the rotate-then-detect step when the board is
+    # near the edge of the camera frame. The original detection already found
+    # the 5 markers, so fall back to a direct homography on the original frame
+    # instead of blocking startup forever.
+    H, _ = cv2.findHomography(corners, DST_CORNERS)
+    if H is not None:
+        homography = H
+        M_rotation = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=np.float32,
+        )
+        last_marker_reference = marker_reference(corners, top_marker)
+        print("  Homography calculated directly on original frame OK")
 
     return corners, top_marker
 
@@ -336,6 +354,8 @@ def normalize_yolo_label(label):
         return 'X'
     if label in ('O', 'CIRCLE', 'CIRCULO', 'CÍRCULO', 'RED', 'ROJO'):
         return 'O'
+    if label in ('BAD', 'BAD_PIECE', 'BAD PIECE', 'WRONG', 'MISPLACED'):
+        return 'BAD_PIECE'
 
     # Si el modelo ya devuelve otra etiqueta, la dejamos visible para debug.
     return label
@@ -369,6 +389,23 @@ def classify_all_zones(rect, cells_s1, cells_board, cells_s2):
         classify_zone(rect, cells_board),
         classify_zone(rect, cells_s2),
     )
+
+
+def has_bad_piece(*zone_results) -> bool:
+    return any('BAD_PIECE' in zone for zone in zone_results)
+
+
+def bad_piece_locations(storage1, board, storage2):
+    locations = []
+    for zone_name, values in (
+        ('storage1', storage1),
+        ('board', board),
+        ('storage2', storage2),
+    ):
+        for index, label in enumerate(values):
+            if label == 'BAD_PIECE':
+                locations.append({'zone': zone_name, 'index': index})
+    return locations
 
 
 def default_storage_score(storage1, storage2):
@@ -424,10 +461,83 @@ def classify_default_layout_or_pause(rect, cells_s1, cells_board, cells_s2):
 
 # ── Visual debug ────────────────────────────────────────────────────────────────
 
+def draw_bad_piece_warning(frame):
+    global _bad_piece_blink_counter, _bad_piece_blink_visible
+
+    _bad_piece_blink_counter += 1
+    if _bad_piece_blink_counter >= BAD_PIECE_BLINK_RATE:
+        _bad_piece_blink_counter = 0
+        _bad_piece_blink_visible = not _bad_piece_blink_visible
+
+    if not _bad_piece_blink_visible:
+        return frame
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 70), (0, 0, 180), -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    pts = np.array([[30, 55], [60, 10], [90, 55]], np.int32)
+    cv2.fillPoly(frame, [pts], (0, 220, 255))
+    cv2.putText(
+        frame, '!', (52, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2
+    )
+    cv2.putText(
+        frame,
+        'PIECE PLACED INCORRECTLY',
+        (105, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (255, 255, 255),
+        2,
+    )
+    cv2.putText(
+        frame,
+        'Remove and place the piece flat inside one board cell',
+        (105, 58),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (220, 220, 220),
+        1,
+    )
+    return frame
+
+
 def draw_zone(rect, cells, results, border_color):
     for (x1, y1, x2, y2), label in zip(cells, results):
+        if label == 'BAD_PIECE':
+            if _bad_piece_blink_visible:
+                overlay = rect.copy()
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 200), -1)
+                cv2.addWeighted(overlay, 0.45, rect, 0.55, 0, rect)
+            cv2.rectangle(rect, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            cv2.putText(
+                rect,
+                'BAD',
+                ((x1 + x2) // 2 - 18, (y1 + y2) // 2 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (0, 0, 255),
+                1,
+            )
+            cv2.putText(
+                rect,
+                'PIECE',
+                ((x1 + x2) // 2 - 22, (y1 + y2) // 2 + 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (0, 0, 255),
+                1,
+            )
+            continue
+
         cv2.rectangle(rect, (x1, y1), (x2, y2), border_color, 1)
-        color_txt = (0, 200, 0) if label == 'EMPTY' else (220, 0, 0) if label == 'O' else (0, 0, 220)
+        color_txt = (
+            (0, 200, 0)
+            if label == 'EMPTY'
+            else (220, 0, 0)
+            if label == 'O'
+            else (0, 0, 220)
+        )
         cv2.putText(
             rect,
             label,
@@ -1001,13 +1111,20 @@ def main():
                         cells_s2,
                     )
 
+                bad_locations = bad_piece_locations(res_s1, res_board, res_s2)
+                bad_piece_detected = bool(bad_locations)
+                if bad_piece_detected:
+                    original_view = draw_bad_piece_warning(original_view)
+
                 estado = {
                     "board": res_board,
                     "storage1": res_s1,
                     "storage2": res_s2,
                     "timestamp": time.time(),
                     "board_detected": True,
-                    "hand_detected": False
+                    "hand_detected": False,
+                    "bad_piece_detected": bad_piece_detected,
+                    "bad_piece_locations": bad_locations,
                 }
 
                 estado_cmp = {k: v for k, v in estado.items() if k != "timestamp"}
