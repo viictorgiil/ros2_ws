@@ -19,10 +19,13 @@ Finished match:
 """
 
 import math
+import time
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QDialog, QLabel, QPushButton, QHBoxLayout, QFrame,
+    QPlainTextEdit,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui  import QFont, QColor, QPainter, QPen, QBrush
@@ -427,6 +430,261 @@ class StarterDialog(QDialog):
         event.ignore()
 
 
+class LogTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._active = False
+        self._session_started_at = 0.0
+        self._last_operation_key = None
+        self._last_game_message = ""
+        self._last_game_message_at = 0.0
+        self._last_warning = ""
+
+        self.setStyleSheet(f"background: {_BG};")
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 16)
+        root.setSpacing(12)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+
+        system_card = self._make_card("SYSTEM STATUS")
+        system_layout = system_card.layout()
+        self._status_value = self._make_value("Waiting for game start")
+        self._mission_value = self._make_value("--")
+        self._task_value = self._make_value("--")
+        self._speed_value = self._make_value("--")
+        system_layout.addWidget(self._make_caption("Robot state"))
+        system_layout.addWidget(self._status_value)
+        system_layout.addWidget(self._make_caption("Mission / task"))
+        system_layout.addWidget(self._mission_value)
+        system_layout.addWidget(self._task_value)
+        system_layout.addWidget(self._make_caption("Motor power"))
+        system_layout.addWidget(self._speed_value)
+
+        self._system_log = QPlainTextEdit()
+        self._system_log.setReadOnly(True)
+        self._system_log.setMaximumBlockCount(120)
+        self._system_log.setMinimumHeight(116)
+        self._system_log.setStyleSheet(self._text_box_style(font_px=11))
+        system_layout.addWidget(self._system_log)
+
+        latency_card = self._make_card("CONTROLLER LATENCY")
+        latency_layout = latency_card.layout()
+        self._latency_value = QLabel("--")
+        self._latency_value.setFont(QFont("JetBrains Mono", 24, QFont.Weight.Bold))
+        self._latency_value.setStyleSheet(f"color: {_GREEN}; border: none;")
+        self._latency_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._latency_detail = self._make_value(
+            "Waiting for robot controller heartbeat"
+        )
+        self._latency_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        latency_layout.addStretch()
+        latency_layout.addWidget(self._latency_value)
+        latency_layout.addWidget(self._latency_detail)
+        latency_layout.addStretch()
+
+        top_row.addWidget(system_card, 3)
+        top_row.addWidget(latency_card, 2)
+        root.addLayout(top_row)
+
+        game_card = self._make_card("GAME / DIAGNOSTIC MESSAGES")
+        game_layout = game_card.layout()
+        self._game_log = QPlainTextEdit()
+        self._game_log.setReadOnly(True)
+        self._game_log.setMaximumBlockCount(300)
+        self._game_log.setStyleSheet(self._text_box_style(font_px=13))
+        game_layout.addWidget(self._game_log)
+        root.addWidget(game_card, 1)
+
+    def _make_card(self, title: str) -> QFrame:
+        card = QFrame()
+        card.setStyleSheet(f"""
+            QFrame {{
+                background: {_SURFACE};
+                border: 1px solid {_BORDER};
+                border-radius: 14px;
+            }}
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(7)
+
+        title_lbl = QLabel(title)
+        title_lbl.setFont(QFont("JetBrains Mono", 8, QFont.Weight.Bold))
+        title_lbl.setStyleSheet(f"color: {_SUBTEXT}; border: none;")
+        layout.addWidget(title_lbl)
+        return card
+
+    def _make_caption(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setFont(QFont("JetBrains Mono", 7, QFont.Weight.Bold))
+        label.setStyleSheet(f"color: {_SUBTEXT}; border: none;")
+        return label
+
+    def _make_value(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setFont(QFont("JetBrains Mono", 9))
+        label.setStyleSheet(f"color: {_TEXT}; border: none;")
+        return label
+
+    def _text_box_style(self, font_px: int = 11) -> str:
+        return f"""
+            QPlainTextEdit {{
+                background: #0b0b12;
+                color: {_TEXT};
+                border: 1px solid {_BORDER};
+                border-radius: 10px;
+                padding: 8px;
+                font-family: 'JetBrains Mono';
+                font-size: {font_px}px;
+            }}
+        """
+
+    def start_session(self, human_symbol: str, ai_symbol: str, teleop: bool):
+        self._active = True
+        self._session_started_at = time.monotonic()
+        self._last_operation_key = None
+        self._last_game_message = ""
+        self._last_game_message_at = 0.0
+        self._last_warning = ""
+        self._system_log.clear()
+        self._game_log.clear()
+        self._status_value.setText("Game active")
+        self._mission_value.setText("--")
+        self._task_value.setText(
+            f"Mode: {'teleoperation' if teleop else 'normal'}"
+        )
+        self._speed_value.setText("--")
+        self._latency_value.setText("--")
+        self._latency_detail.setText("Waiting for robot controller heartbeat")
+
+    def end_session(self, clear: bool = True):
+        self._active = False
+        self._last_operation_key = None
+        self._last_warning = ""
+        self._status_value.setText("Logging inactive")
+        self._mission_value.setText("--")
+        self._task_value.setText("--")
+        self._speed_value.setText("--")
+        self._latency_value.setText("--")
+        self._latency_detail.setText("No active game session")
+        if clear:
+            self._system_log.clear()
+            self._game_log.clear()
+
+    def append_game(self, message: str, level: str = "INFO"):
+        if not self._active:
+            return
+        now = time.monotonic()
+        if message == self._last_game_message and now - self._last_game_message_at < 1.0:
+            return
+        self._last_game_message = message
+        self._last_game_message_at = now
+        self._game_log.appendPlainText(
+            f"[{self._elapsed_timestamp()} | {self._wall_timestamp()}] "
+            f"{level.upper():<5} {message}"
+        )
+
+    def update_robot_status(self, status: str):
+        if not self._active:
+            return
+        self._status_value.setText(status)
+
+    def update_operation(self, payload: dict):
+        if not self._active:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        status = str(payload.get("status", "--"))
+        mission = str(payload.get("mission_id", "--"))
+        task = str(payload.get("task", "--"))
+        phase = str(payload.get("phase", "--"))
+        target = str(payload.get("target", "--"))
+        speed = self._format_motor_power(payload.get("motor_power_pct"))
+        latency_ms = payload.get("latency_ms")
+
+        self._status_value.setText(status)
+        self._mission_value.setText(mission)
+        self._task_value.setText(f"{task} / {phase} -> {target}")
+        self._speed_value.setText(speed)
+        self._update_latency(latency_ms, payload)
+
+        operation_key = (
+            status,
+            mission,
+            task,
+            phase,
+            target,
+            speed,
+        )
+        if operation_key == self._last_operation_key:
+            return
+        self._last_operation_key = operation_key
+        ts = self._timestamp_from_payload(payload)
+        self._system_log.appendPlainText(
+            f"[{ts}] {mission} | {status} | {task} | {phase} -> {target} | "
+            f"motors {speed}"
+        )
+
+    def _update_latency(self, latency_ms, payload: dict):
+        if latency_ms is None:
+            self._latency_value.setText("--")
+            self._latency_detail.setText("No timestamp in controller heartbeat")
+            return
+
+        try:
+            latency = float(latency_ms)
+        except (TypeError, ValueError):
+            return
+
+        color = _GREEN if latency < 50.0 else _YELLOW if latency < 150.0 else _RED
+        self._latency_value.setStyleSheet(f"color: {color}; border: none;")
+        self._latency_value.setText(f"{latency:.1f} ms")
+        mode = str(payload.get("mode", "controller"))
+        self._latency_detail.setText(
+            f"{mode} heartbeat received at {self._wall_timestamp()}"
+        )
+
+    def _format_motor_power(self, values) -> str:
+        if isinstance(values, dict) and values:
+            parts = []
+            for index, (_name, value) in enumerate(values.items(), start=1):
+                try:
+                    pct = float(value)
+                except (TypeError, ValueError):
+                    pct = 0.0
+                parts.append(f"J{index}:{pct:.0f}%")
+            return " ".join(parts)
+
+        try:
+            pct = float(values)
+        except (TypeError, ValueError):
+            return "--"
+        return " ".join(f"J{i}:{pct:.0f}%" for i in range(1, 7))
+
+    def _elapsed_timestamp(self) -> str:
+        elapsed = max(0.0, time.monotonic() - self._session_started_at)
+        minutes = int(elapsed // 60)
+        seconds = elapsed - minutes * 60
+        return f"T+{minutes:02d}:{seconds:06.3f}"
+
+    def _wall_timestamp(self) -> str:
+        return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+    def _timestamp_from_payload(self, payload: dict) -> str:
+        timestamp_ns = payload.get("timestamp_ns")
+        try:
+            return datetime.fromtimestamp(
+                int(timestamp_ns) / 1_000_000_000
+            ).strftime("%H:%M:%S.%f")
+        except (TypeError, ValueError, OSError):
+            return datetime.now().strftime("%H:%M:%S.%f")
+
+
 # ─────────────────────────────────────── MainWindow
 
 class MainWindow(QMainWindow):
@@ -485,26 +743,27 @@ class MainWindow(QMainWindow):
         teleop_layout.addWidget(self._teleop_camera)
         self._tabs.addTab(teleop_tab, "🕹️  Teleoperation")
 
-        # ── log tab (placeholder) ─────────────────────────────────────
-        log_tab = QWidget()
-        log_tab.setStyleSheet("background: #11111b;")
-        self._tabs.addTab(log_tab, "📋  Log")
+        # ── log tab ───────────────────────────────────────────────────
+        self._log_tab = LogTab()
+        self._tabs.addTab(self._log_tab, "📋  Log")
 
         # ── bridge signals ─────────────────────────────────────────────
         bridge.move_completed.connect(self._on_move_completed)
-        bridge.robot_status_changed.connect(self._board.on_status_changed)
+        bridge.robot_status_changed.connect(self._on_robot_status_changed)
         bridge.game_over.connect(self._board.on_game_over)
         bridge.game_over.connect(self._on_game_over)
-        bridge.ai_thinking.connect(self._board.on_ai_thinking)
-        bridge.human_turn_started.connect(self._board.on_human_turn_started)
-        bridge.robot_placing_human.connect(self._board.on_robot_placing_human)
+        bridge.ai_thinking.connect(self._on_ai_thinking)
+        bridge.human_turn_started.connect(self._on_human_turn_started)
+        bridge.robot_placing_human.connect(self._on_robot_placing_human)
         bridge.emergency_confirmed.connect(self._on_emergency_confirmed)
         bridge.original_frame_ready.connect(self._on_original_frame)
         bridge.rectified_frame_ready.connect(self._on_rectified_frame)
-        bridge.vision_warning_changed.connect(self._board.set_vision_warning)
+        bridge.vision_warning_changed.connect(self._on_vision_warning_changed)
         bridge.vision_provisional_move.connect(self._board.on_vision_provisional_move)
         bridge.vision_display_mode_changed.connect(self._on_vision_display_mode)
         bridge.board_cell_cleared.connect(self._board.clear_board_cell)
+        bridge.operation_status_changed.connect(self._log_tab.update_operation)
+        bridge.stop_caused.connect(self._on_stop_caused)
         # reset_completed is handled in main() to keep the active window alive.
 
         # ── board signals ──────────────────────────────────────────────
@@ -525,6 +784,11 @@ class MainWindow(QMainWindow):
         self._teleop       = teleop
 
         self._board.reset(
+            human_symbol=self._human_symbol,
+            ai_symbol=self._ai_symbol,
+            teleop=teleop,
+        )
+        self._log_tab.start_session(
             human_symbol=self._human_symbol,
             ai_symbol=self._ai_symbol,
             teleop=teleop,
@@ -551,9 +815,41 @@ class MainWindow(QMainWindow):
 
     # ── internal slots ─────────────────────────────────────────────────
 
+    def _on_robot_status_changed(self, status: str):
+        self._board.on_status_changed(status)
+        self._log_tab.update_robot_status(status)
+
+    def _on_ai_thinking(self, cell: int):
+        self._board.on_ai_thinking(cell)
+        self._log_tab.append_game(
+            f"Game status: robot turn started; planned board cell {cell}."
+        )
+
+    def _on_human_turn_started(self):
+        self._board.on_human_turn_started()
+        self._log_tab.append_game("Game status: human turn started.")
+
+    def _on_robot_placing_human(self):
+        self._board.on_robot_placing_human()
+
+    def _on_vision_warning_changed(self, text: str):
+        self._board.set_vision_warning(text)
+
+    def _on_stop_caused(self, cause: str):
+        self._log_tab.append_game(f"Stop caused: {cause}.", level="WARN")
+
     def _on_move_completed(self, cell_index: int):
         """Determine the completed move symbol and draw it."""
         cell_btn = self._board._cells[cell_index]
+        if cell_btn.is_empty:
+            symbol = self._ai_symbol
+        else:
+            symbol = cell_btn.symbol or self._human_symbol
+        actor = "human" if symbol == self._human_symbol else "robot"
+        self._log_tab.append_game(
+            f"Game status: {actor} turn completed; {symbol} left at "
+            f"board cell {cell_index}."
+        )
         if cell_btn.is_empty:
             self._board.on_move_completed(cell_index, self._ai_symbol)
 
@@ -582,6 +878,7 @@ class MainWindow(QMainWindow):
         Emergency restart: do not collect pieces. Send the robot home, close
         this window, and reopen SetupDialog.
         """
+        self._log_tab.end_session(clear=True)
         self._board._status_bar.set_turn("🏠 Returning home...", _YELLOW)
         self._board._show_active_stop_button()
         self._node.go_home_and_reset()
@@ -591,6 +888,7 @@ class MainWindow(QMainWindow):
         Finished-match restart: collect board pieces into the detected storage
         holes, then go home and reopen SetupDialog.
         """
+        self._log_tab.end_session(clear=True)
         self._board._status_bar.set_turn("🧹 Collecting board pieces...", _YELLOW)
         self._board._show_active_stop_button()
         self._node.collect_board_and_reset()
@@ -604,6 +902,12 @@ class MainWindow(QMainWindow):
     def _on_game_over(self, result: str):
         if self._match_finished_dialog_open:
             return
+        if result == "TIE":
+            self._log_tab.append_game("Game status: match finished with a tie.")
+        elif result == self._human_symbol:
+            self._log_tab.append_game("Game status: match finished; human wins.")
+        else:
+            self._log_tab.append_game("Game status: match finished; robot wins.")
         self._match_finished_dialog_open = True
 
         dlg = MatchFinishedDialog(result, self._human_symbol, self)
@@ -619,18 +923,20 @@ class MainWindow(QMainWindow):
         """Disconnect all bridge signals from this window."""
         try:
             self._bridge.move_completed.disconnect(self._on_move_completed)
-            self._bridge.robot_status_changed.disconnect(self._board.on_status_changed)
+            self._bridge.robot_status_changed.disconnect(self._on_robot_status_changed)
             self._bridge.game_over.disconnect(self._board.on_game_over)
-            self._bridge.ai_thinking.disconnect(self._board.on_ai_thinking)
-            self._bridge.human_turn_started.disconnect(self._board.on_human_turn_started)
-            self._bridge.robot_placing_human.disconnect(self._board.on_robot_placing_human)
+            self._bridge.ai_thinking.disconnect(self._on_ai_thinking)
+            self._bridge.human_turn_started.disconnect(self._on_human_turn_started)
+            self._bridge.robot_placing_human.disconnect(self._on_robot_placing_human)
             self._bridge.emergency_confirmed.disconnect(self._on_emergency_confirmed)
             self._bridge.original_frame_ready.disconnect(self._on_original_frame)
             self._bridge.rectified_frame_ready.disconnect(self._on_rectified_frame)
-            self._bridge.vision_warning_changed.disconnect(self._board.set_vision_warning)
+            self._bridge.vision_warning_changed.disconnect(self._on_vision_warning_changed)
             self._bridge.vision_provisional_move.disconnect(self._board.on_vision_provisional_move)
             self._bridge.vision_display_mode_changed.disconnect(self._on_vision_display_mode)
             self._bridge.board_cell_cleared.disconnect(self._board.clear_board_cell)
+            self._bridge.operation_status_changed.disconnect(self._log_tab.update_operation)
+            self._bridge.stop_caused.disconnect(self._on_stop_caused)
             # reset_completed is handled in main()
         except RuntimeError:
             pass

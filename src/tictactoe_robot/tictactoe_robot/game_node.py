@@ -50,6 +50,7 @@ ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
 RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
 VISION_STATE_TOPIC = "/tictactoe/tablero"
 GAME_TURN_TOPIC = "/tictactoe/game/turn"
+OPERATION_STATUS_TOPIC = "/robot_controller/operation_status"
 HUMAN_VISION_STABLE_SEC = 2.0
 HOME_JOINT_TOLERANCE_RAD = 0.08
 UR3_JOINTS = [
@@ -190,6 +191,8 @@ class RosSignalBridge(QObject):
     vision_provisional_move = pyqtSignal(int)
     vision_display_mode_changed = pyqtSignal(str)
     board_cell_cleared = pyqtSignal(int)
+    operation_status_changed = pyqtSignal(object)
+    stop_caused = pyqtSignal(str)
 
 
 class GameNode(Node):
@@ -267,6 +270,12 @@ class GameNode(Node):
             String,
             "/robot_controller/robot_status",
             self._status_callback,
+            10,
+        )
+        self.create_subscription(
+            String,
+            OPERATION_STATUS_TOPIC,
+            self._operation_status_callback,
             10,
         )
         self.create_subscription(
@@ -483,7 +492,7 @@ class GameNode(Node):
             self._bridge.robot_status_changed.emit("BUSY")
             threading.Thread(target=self._do_ai_turn, daemon=True).start()
 
-    def emergency_stop(self):
+    def emergency_stop(self, cause: str = "STOP button pressed"):
         """
         Emergency stop.
 
@@ -491,7 +500,7 @@ class GameNode(Node):
         2. Cancel the active action-server goal to stop the UR3.
         3. Emit emergency_confirmed immediately so the GUI can react.
         """
-        self.get_logger().warn("⛔ emergency_stop() activated.")
+        self.get_logger().warn(f"⛔ emergency_stop() activated: {cause}.")
         self._game_started = False
         self._emergency_event.set()
         if self._restart_collection_active:
@@ -506,6 +515,7 @@ class GameNode(Node):
             gh.cancel_goal_async()
 
         # Emit immediately; the dialog does not wait for ROS 2
+        self._bridge.stop_caused.emit(cause)
         self._bridge.emergency_confirmed.emit()
 
         # Do not touch _move_was_completed or _move_logic_applied here.
@@ -792,6 +802,24 @@ class GameNode(Node):
     def _status_callback(self, msg: String):
         self._bridge.robot_status_changed.emit(msg.data)
 
+    def _operation_status_callback(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            data = {"status": msg.data}
+
+        timestamp_ns = data.get("timestamp_ns")
+        try:
+            latency_ms = max(
+                0.0,
+                (time.time_ns() - int(timestamp_ns)) / 1_000_000.0,
+            )
+        except (TypeError, ValueError):
+            latency_ms = None
+
+        data["latency_ms"] = latency_ms
+        self._bridge.operation_status_changed.emit(data)
+
     def _image_to_qimage(self, msg: Image) -> QImage | None:
         if msg.width == 0 or msg.height == 0 or not msg.data:
             return None
@@ -878,7 +906,7 @@ class GameNode(Node):
         ):
             self._set_vision_warning("Hand detected during robot turn.")
             if not self._emergency_event.is_set():
-                self.emergency_stop()
+                self.emergency_stop(cause="hand detected by vision")
             return
 
         if (

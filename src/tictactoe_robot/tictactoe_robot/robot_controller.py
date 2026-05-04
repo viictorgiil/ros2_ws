@@ -145,6 +145,24 @@ class RobotController(Node):
 
         # ── State Publisher ─────────────────────────────────────────
         self._status_pub = self.create_publisher(String, "~/robot_status", 10)
+        self._operation_pub = self.create_publisher(
+            String,
+            "~/operation_status",
+            10,
+        )
+        self._operation_lock = threading.Lock()
+        self._mission_counter = 0
+        self._current_operation = {
+            "mission_id": "IDLE",
+            "task": "Idle",
+            "status": "IDLE",
+            "phase": "idle",
+            "target": "-",
+            "fast": False,
+            "mode": "simulation" if self._simulate else "hardware",
+            "motor_power_pct": {joint: 0.0 for joint in UR3_JOINTS},
+        }
+        self.create_timer(0.5, self._publish_operation_status)
 
         # ── Action server place_piece ───────────────────────────────────
         self._action_server = ActionServer(
@@ -204,6 +222,21 @@ class RobotController(Node):
 
         self.get_logger().info(
             f"PlacePiece goal received: symbol='{symbol}' cell={cell_index}"
+        )
+        mission_id = self._next_mission_id("HOME" if symbol == "HOME" else "PLACE")
+        task = (
+            "Return robot to HOME"
+            if symbol == "HOME"
+            else f"Place {symbol} in board_{cell_index}"
+        )
+        self._set_operation(
+            mission_id=mission_id,
+            task=task,
+            status="BUSY",
+            phase="goal_received",
+            target="home" if symbol == "HOME" else f"cell_{cell_index}",
+            fast=False,
+            motor_power_pct=self._motor_power(60.0),
         )
 
         result = PlacePiece.Result()
@@ -288,6 +321,15 @@ class RobotController(Node):
             f"MovePiece goal received: '{source_slot}' -> '{target_slot}' "
             f"(fast={fast})"
         )
+        self._set_operation(
+            mission_id=self._next_mission_id("MOVE"),
+            task=f"Move {source_slot} -> {target_slot}",
+            status="BUSY",
+            phase="goal_received",
+            target=target_slot,
+            fast=fast,
+            motor_power_pct=self._motor_power(100.0 if fast else 60.0),
+        )
 
         result = MovePiece.Result()
         try:
@@ -344,6 +386,12 @@ class RobotController(Node):
     def _open_gripper(self):
         if self._cancel_requested.is_set():
             raise _EmergencyStop()
+        self._set_operation(
+            status="GRIPPER",
+            phase="open_gripper",
+            target="gripper",
+            motor_power_pct=self._motor_power(0.0),
+        )
         if self._simulate:
             self.get_logger().info("  🤏 [SIM] Gripper: OPEN")
             self._mark_context_holding_piece(False)
@@ -362,6 +410,12 @@ class RobotController(Node):
     def _close_gripper(self):
         if self._cancel_requested.is_set():
             raise _EmergencyStop()
+        self._set_operation(
+            status="GRIPPER",
+            phase="close_gripper",
+            target="gripper",
+            motor_power_pct=self._motor_power(0.0),
+        )
         if self._simulate:
             self.get_logger().info("  🤏 [SIM] Gripper: CLOSED")
             self._mark_context_holding_piece(True)
@@ -382,9 +436,18 @@ class RobotController(Node):
     def _move_to(self, joints: list[float], label: str = "", phase: str = "",
                  goal_handle=None, fast: bool = False):
         self.get_logger().info(f"  → Moving to '{label}'…")
-        self._publish_status(f"MOVING: {label}")
         waypoint_time = FAST_WAYPOINT_TIME if fast else WAYPOINT_TIME
         sim_waypoint_time = FAST_SIM_WAYPOINT_TIME if fast else SIM_WAYPOINT_TIME
+        speed_percent = 100.0 if fast else 60.0
+        self._set_operation(
+            status="MOVING",
+            phase=phase or label,
+            target=label,
+            fast=fast,
+            waypoint_time_sec=waypoint_time,
+            motor_power_pct=self._motor_power(speed_percent),
+        )
+        self._publish_status(f"MOVING: {label}", update_operation=False)
 
         # Publish feedback when a goal_handle exists
         if goal_handle is not None:
@@ -654,10 +717,58 @@ class RobotController(Node):
             time.sleep(step)
             elapsed += step
 
-    def _publish_status(self, status: str):
+    def _next_mission_id(self, prefix: str) -> str:
+        self._mission_counter += 1
+        return f"{prefix}-{self._mission_counter:04d}"
+
+    def _motor_power(self, percent: float) -> dict[str, float]:
+        return {joint: float(percent) for joint in UR3_JOINTS}
+
+    def _set_operation(self, **updates):
+        with self._operation_lock:
+            self._current_operation.update(updates)
+        self._publish_operation_status()
+
+    def _publish_operation_status(self):
+        if not hasattr(self, "_operation_pub"):
+            return
+        with self._operation_lock:
+            payload = dict(self._current_operation)
+        payload["timestamp_ns"] = time.time_ns()
+        payload["timestamp"] = time.time()
+
+        msg = String()
+        msg.data = json.dumps(payload, separators=(",", ":"))
+        self._operation_pub.publish(msg)
+
+    def _publish_status(self, status: str, update_operation: bool = True):
         msg      = String()
         msg.data = status
         self._status_pub.publish(msg)
+        if not update_operation:
+            return
+
+        updates = {"status": status}
+        status_upper = status.upper()
+        if status_upper == "IDLE":
+            updates.update(
+                {
+                    "mission_id": "IDLE",
+                    "task": "Idle",
+                    "phase": "idle",
+                    "target": "-",
+                    "fast": False,
+                    "motor_power_pct": self._motor_power(0.0),
+                }
+            )
+        elif status_upper == "EMERGENCY_STOP":
+            updates.update(
+                {
+                    "phase": "emergency_stop",
+                    "motor_power_pct": self._motor_power(0.0),
+                }
+            )
+        self._set_operation(**updates)
 
     # ─────────────────────────────────────── go home (for restart)
 
