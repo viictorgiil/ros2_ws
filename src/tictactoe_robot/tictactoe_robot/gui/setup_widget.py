@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QFrame, QSizePolicy,
 )
 from PyQt6.QtCore import pyqtSignal, Qt
-from PyQt6.QtGui  import QFont
+from PyQt6.QtGui  import QFont, QFontDatabase
 
 
 # ─────────────────────────────────────────────────── palette / constants
@@ -47,6 +47,21 @@ _FONT_BIG    = QFont("JetBrains Mono", 22, QFont.Weight.Bold)
 _FONT_SMALL  = QFont("JetBrains Mono", 8)
 
 
+def _emoji_font(point_size: int = 18) -> QFont:
+    families = set(QFontDatabase.families())
+    for family in ("Noto Color Emoji", "Segoe UI Emoji", "Apple Color Emoji"):
+        if family in families:
+            return QFont(family, point_size)
+    return QFont("Sans Serif", point_size)
+
+
+def _split_leading_icon(label: str) -> tuple[str, str] | None:
+    parts = label.strip().split(maxsplit=1)
+    if len(parts) == 2 and parts[0] in {"🤖", "🕹️"}:
+        return parts[0], parts[1]
+    return None
+
+
 def _h_line() -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
@@ -67,15 +82,61 @@ class ToggleButton(QPushButton):
         super().__init__()
         self._accent = accent
         self._fill_alpha = fill_alpha
+        self._icon_lbl: QLabel | None = None
+        self._title_lbl: QLabel | None = None
+        self._sub_lbl: QLabel | None = None
         self.setCheckable(True)
         self.setFont(_FONT_BUTTON)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMinimumHeight(64)
-        self.setText(f"{label}\n{sublabel}" if sublabel else label)
+        icon_parts = _split_leading_icon(label)
+        if icon_parts is None:
+            self.setText(f"{label}\n{sublabel}" if sublabel else label)
+        else:
+            self.setText("")
+            icon, title = icon_parts
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(12, 7, 12, 7)
+            layout.setSpacing(2)
+
+            title_row = QHBoxLayout()
+            title_row.setSpacing(8)
+            title_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            self._icon_lbl = QLabel(icon)
+            self._icon_lbl.setFont(_emoji_font(18))
+            self._icon_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            title_row.addWidget(self._icon_lbl)
+
+            self._title_lbl = QLabel(title)
+            self._title_lbl.setFont(_FONT_BUTTON)
+            self._title_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            title_row.addWidget(self._title_lbl)
+            layout.addLayout(title_row)
+
+            if sublabel:
+                self._sub_lbl = QLabel(sublabel)
+                self._sub_lbl.setFont(_FONT_SMALL)
+                self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._sub_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                layout.addWidget(self._sub_lbl)
         self._refresh_style(False)
         self.toggled.connect(self._refresh_style)
 
     def _refresh_style(self, checked: bool):
+        text_color = _TEXT if checked else _SUBTEXT
+        if self._icon_lbl is not None:
+            self._icon_lbl.setStyleSheet(
+                "background: transparent; border: none;"
+            )
+        if self._title_lbl is not None:
+            self._title_lbl.setStyleSheet(
+                f"background: transparent; border: none; color: {text_color};"
+            )
+        if self._sub_lbl is not None:
+            self._sub_lbl.setStyleSheet(
+                f"background: transparent; border: none; color: {text_color};"
+            )
         if checked:
             self.setStyleSheet(f"""
                 QPushButton {{
@@ -174,7 +235,7 @@ class SetupDialog(QDialog):
         title.setStyleSheet(f"color: {_TEXT};")
         root.addWidget(title)
 
-        subtitle = QLabel("Human  vs  Robot  │  Minimax + Alpha-Beta Pruning")
+        subtitle = QLabel("Human  vs  Robot  │  Alpha-Beta Pruning")
         subtitle.setFont(_FONT_LABEL)
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet(f"color: {_SUBTEXT};")
@@ -187,7 +248,7 @@ class SetupDialog(QDialog):
 
         self._btn_normal = ToggleButton(
             "🤖  Normal",
-            "AI moves its own pieces",
+            "The user moves their own pieces",
             _ACCENT_GREEN,
             "3d",
         )

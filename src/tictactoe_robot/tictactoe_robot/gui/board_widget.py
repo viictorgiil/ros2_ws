@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore  import pyqtSignal, Qt
 from PyQt6.QtGui   import QFont, QImage, QPixmap
 
+from tictactoe_robot.gui.setup_widget import _emoji_font
+
 
 # ─────────────────────────────────────── palette
 
@@ -41,6 +43,19 @@ _FONT_CELL    = QFont("JetBrains Mono", 38, QFont.Weight.Bold)
 _FONT_STATUS  = QFont("JetBrains Mono", 11, QFont.Weight.Bold)
 _FONT_CONFIRM = QFont("JetBrains Mono", 11, QFont.Weight.Bold)
 _FONT_STOP    = QFont("JetBrains Mono", 9,  QFont.Weight.Bold)
+
+_STATUS_EMOJIS = {"📷", "✋", "🦾", "🤝", "🎉", "🤖", "🤔", "⛔", "🏠", "🧹", "⏳"}
+
+
+def _split_status_icon(text: str) -> tuple[str, str]:
+    stripped = text.strip()
+    for icon in sorted(_STATUS_EMOJIS, key=len, reverse=True):
+        if stripped.startswith(icon):
+            return icon, stripped[len(icon):].strip()
+    for icon in sorted(_STATUS_EMOJIS, key=len, reverse=True):
+        if stripped.endswith(icon):
+            return icon, stripped[: -len(icon)].strip()
+    return "", text
 
 
 def _symbol_color(symbol: str, provisional: bool = False) -> str:
@@ -150,20 +165,52 @@ class RobotStatusBar(QFrame):
         layout.addStretch()
 
         # ── turn label ──────────────────────────────────────────────────
+        self._turn_wrap = QWidget()
+        self._turn_wrap.setStyleSheet("background: transparent; border: none;")
+        turn_layout = QHBoxLayout(self._turn_wrap)
+        turn_layout.setContentsMargins(0, 0, 0, 0)
+        turn_layout.setSpacing(6)
+        turn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._turn_icon_lbl = QLabel("")
+        self._turn_icon_lbl.setFont(_emoji_font(14))
+        self._turn_icon_lbl.setStyleSheet("background: transparent; border: none;")
+        self._turn_icon_lbl.setVisible(False)
+        turn_layout.addWidget(self._turn_icon_lbl)
+
         self._turn_lbl = QLabel("")
         self._turn_lbl.setFont(_FONT_STATUS)
         self._turn_lbl.setStyleSheet(f"color: {_TEXT}; border: none;")
-        layout.addWidget(self._turn_lbl)
+        turn_layout.addWidget(self._turn_lbl)
+        layout.addWidget(self._turn_wrap)
 
         layout.addStretch()
 
         # ── emergency button ────────────────────────────────────────────
-        self._stop_btn = QPushButton("⛔  STOP")
+        self._stop_btn = QPushButton("")
         self._stop_btn.setFont(_FONT_STOP)
         self._stop_btn.setFixedHeight(34)
         self._stop_btn.setMinimumWidth(80)
         self._stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._stop_btn.setVisible(False)   # hidden by default
+        stop_layout = QHBoxLayout(self._stop_btn)
+        stop_layout.setContentsMargins(10, 0, 10, 0)
+        stop_layout.setSpacing(6)
+        stop_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._stop_icon_lbl = QLabel("⛔")
+        self._stop_icon_lbl.setFont(_emoji_font(11))
+        self._stop_icon_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._stop_icon_lbl.setStyleSheet("background: transparent; border: none;")
+        stop_layout.addWidget(self._stop_icon_lbl)
+
+        self._stop_text_lbl = QLabel("STOP")
+        self._stop_text_lbl.setFont(_FONT_STOP)
+        self._stop_text_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._stop_text_lbl.setStyleSheet(
+            "background: transparent; border: none; color: #ef4444;"
+        )
+        stop_layout.addWidget(self._stop_text_lbl)
         self._stop_btn.setStyleSheet(f"""
             QPushButton {{
                 background: #fecdd333;
@@ -203,8 +250,11 @@ class RobotStatusBar(QFrame):
         self._robot_lbl.setText(f"Robot: {status}")
 
     def set_turn(self, text: str, color: str = _TEXT):
+        icon, body = _split_status_icon(text)
+        self._turn_icon_lbl.setText(icon)
+        self._turn_icon_lbl.setVisible(bool(icon))
         self._turn_lbl.setStyleSheet(f"color: {color}; border: none;")
-        self._turn_lbl.setText(text)
+        self._turn_lbl.setText(body)
 
     def show_stop_button(self, visible: bool, enabled: bool = True):
         """
@@ -218,7 +268,11 @@ class RobotStatusBar(QFrame):
     def set_stop_button_pressed(self):
         """Disable the button after it is pressed to prevent double clicks."""
         self._stop_btn.setEnabled(False)
-        self._stop_btn.setText("⏳  Stopping...")
+        self.set_stop_button_text("⏳", "Stopping...")
+
+    def set_stop_button_text(self, icon: str, text: str):
+        self._stop_icon_lbl.setText(icon)
+        self._stop_text_lbl.setText(text)
 
 
 # ─────────────────────────────────────── CameraPlaceholder
@@ -247,7 +301,7 @@ class CameraPlaceholder(QFrame):
         )
         layout.addWidget(self._cam_label)
 
-        self._placeholder_lbl = QLabel("📷  Camera not connected")
+        self._placeholder_lbl = QLabel("Camera not connected")
         self._placeholder_lbl.setFont(QFont("JetBrains Mono", 10))
         self._placeholder_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder_lbl.setStyleSheet(f"color: {_SUBTEXT}; border: none;")
@@ -454,6 +508,11 @@ class BoardWidget(QWidget):
     def on_status_changed(self, status: str):
         self._status_bar.set_robot_status(status)
         status_upper = status.upper()
+        if status_upper == "VISION_PAUSED" and not self._human_turn:
+            self._status_bar.set_turn("Checking vision before resume...", _YELLOW)
+            self._status_bar.show_stop_button(visible=False)
+            return
+
         if (
             not self._human_turn
             and (
@@ -567,9 +626,9 @@ class BoardWidget(QWidget):
         self.emergency_requested.emit()
 
     def _reset_stop_button(self):
-        self._status_bar._stop_btn.setText("⛔  STOP")
+        self._status_bar.set_stop_button_text("⛔", "STOP")
         self._status_bar.show_stop_button(visible=False, enabled=True)
 
     def _show_active_stop_button(self):
-        self._status_bar._stop_btn.setText("⛔  STOP")
+        self._status_bar.set_stop_button_text("⛔", "STOP")
         self._status_bar.show_stop_button(visible=True, enabled=True)

@@ -31,7 +31,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui  import QFont, QColor, QPainter, QPen, QBrush
 
 from tictactoe_robot.gui.board_widget import BoardWidget, CameraPlaceholder
-from tictactoe_robot.gui.setup_widget import SetupDialog
+from tictactoe_robot.gui.setup_widget import SetupDialog, _emoji_font
 
 
 # ─────────────────────────────────────── local palette
@@ -73,7 +73,7 @@ class EmergencyDialog(QDialog):
 
         # ── icon + title ───────────────────────────────────────────────
         icon_lbl = QLabel("⛔")
-        icon_lbl.setFont(QFont("JetBrains Mono", 36))
+        icon_lbl.setFont(_emoji_font(36))
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_lbl.setStyleSheet("border: none;")
         root.addWidget(icon_lbl)
@@ -201,7 +201,7 @@ class MatchFinishedDialog(QDialog):
         root.setSpacing(20)
 
         icon_lbl = QLabel(icon)
-        icon_lbl.setFont(QFont("JetBrains Mono", 36))
+        icon_lbl.setFont(_emoji_font(36))
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_lbl.setStyleSheet("border: none;")
         root.addWidget(icon_lbl)
@@ -701,6 +701,8 @@ class MainWindow(QMainWindow):
         self._game_camera_mode = "rectified"
         self._last_original_frame = None
         self._last_rectified_frame = None
+        self._closing_for_reset = False
+        self._shutdown_requested = False
 
         self.setWindowTitle("TicTacToe × UR3")
         self.setMinimumSize(560, 820)
@@ -879,7 +881,11 @@ class MainWindow(QMainWindow):
         this window, and reopen SetupDialog.
         """
         self._log_tab.end_session(clear=True)
-        self._board._status_bar.set_turn("🏠 Returning home...", _YELLOW)
+        home_state = self._node.robot_home_state(timeout=0.6)
+        if home_state is False:
+            self._board._status_bar.set_turn("🏠 Returning home...", _YELLOW)
+        else:
+            self._board._status_bar.set_turn("Resetting game...", _YELLOW)
         self._board._show_active_stop_button()
         self._node.go_home_and_reset()
 
@@ -944,6 +950,24 @@ class MainWindow(QMainWindow):
     def _on_reset_completed(self):
         """No-op: main() handles reset window lifecycle."""
         pass
+
+    def close_for_reset(self):
+        self._closing_for_reset = True
+        self.close()
+
+    def closeEvent(self, event):
+        if self._closing_for_reset:
+            event.accept()
+            return
+
+        if not self._shutdown_requested:
+            self._shutdown_requested = True
+            self._node.request_gui_shutdown()
+            app = QApplication.instance()
+            if app is not None:
+                QTimer.singleShot(250, app.quit)
+
+        event.accept()
 
 
 # ─────────────────────────────────────── launch_app

@@ -243,8 +243,13 @@ class RobotController(Node):
 
         # Special goal: return home after an emergency restart
         if symbol == "HOME":
+            reset_stock = cell_index == -2
+            hold_piece_for_validation = cell_index == -3
             try:
-                self.go_home()
+                self.go_home(
+                    reset_stock=reset_stock,
+                    hold_piece_for_validation=hold_piece_for_validation,
+                )
             except _EmergencyStop:
                 self.get_logger().warn("HOME interrupted by emergency.")
                 self._publish_status("EMERGENCY_STOP")
@@ -263,6 +268,31 @@ class RobotController(Node):
             goal_handle.succeed()
             result.success = True
             result.message = "Robot at home"
+            self._active_goal_handle = None
+            return result
+
+        if symbol == "RETURN_HELD_HOME":
+            reset_stock = cell_index == -2
+            try:
+                self.return_held_piece_home(reset_stock=reset_stock)
+            except _EmergencyStop:
+                self.get_logger().warn("Return-held-home interrupted by emergency.")
+                self._publish_status("EMERGENCY_STOP")
+                goal_handle.canceled()
+                result.success = False
+                result.message = "Emergency stop activated during held-piece return"
+                self._active_goal_handle = None
+                return result
+            except Exception as e:
+                self.get_logger().error(f"return_held_piece_home failed: {e}")
+                goal_handle.abort()
+                result.success = False
+                result.message = str(e)
+                self._active_goal_handle = None
+                return result
+            goal_handle.succeed()
+            result.success = True
+            result.message = "Held piece returned and robot at home"
             self._active_goal_handle = None
             return result
 
@@ -431,6 +461,36 @@ class RobotController(Node):
         self._mark_context_holding_piece(True)
         self._interruptible_sleep(GRIPPER_WAIT)
 
+    def _consume_context_source_after_target_release(self):
+        context = self._resume_context
+        if not self._context_target_released(context):
+            return
+        if context.get("source_consumed", False):
+            return
+
+        if context.get("mode") == "place_piece":
+            symbol = str(context.get("symbol", "")).upper()
+            if symbol in self._stock_index:
+                try:
+                    source_index = int(
+                        context.get("stock_index", self._stock_index[symbol])
+                    )
+                except (TypeError, ValueError):
+                    source_index = self._stock_index[symbol]
+                if self._stock_index[symbol] <= source_index:
+                    self._stock_index[symbol] = source_index + 1
+
+        context["source_consumed"] = True
+        self._publish_operation_status()
+
+    def _open_gripper_at_target(self):
+        try:
+            self._open_gripper()
+        except _EmergencyStop:
+            self._consume_context_source_after_target_release()
+            raise
+        self._consume_context_source_after_target_release()
+
     # ─────────────────────────────────────── movement
 
     def _move_to(self, joints: list[float], label: str = "", phase: str = "",
@@ -557,6 +617,7 @@ class RobotController(Node):
             f"pick_stock_{idx}" if symbol == "O"
             else f"pick_stock_{idx}_X"
         )
+        stock_slot = f"storage2_{idx - 1}" if symbol == "O" else f"storage1_{idx - 1}"
         cell_key = f"cell_{cell_index}"
 
         stock_joints   = self.positions[stock_key]
@@ -586,7 +647,7 @@ class RobotController(Node):
                 cell_approach, f"{cell_key}_app", "approach_cell", goal_handle
             ),
             lambda: self._move_to(cell_joints, cell_key, "place", goal_handle),
-            self._open_gripper,
+            self._open_gripper_at_target,
             lambda: self._move_to(
                 cell_approach, f"{cell_key}_app", "approach_cell", goal_handle
             ),
@@ -601,6 +662,9 @@ class RobotController(Node):
                 "mode": "place_piece",
                 "symbol": symbol,
                 "cell_index": cell_index,
+                "stock_index": idx,
+                "source_slot": stock_slot,
+                "target_slot": f"board_{cell_index}",
                 "next_step": step_index,
             }
             self._check_cancel()
@@ -608,7 +672,8 @@ class RobotController(Node):
 
         self._resume_context = None
 
-        self._stock_index[symbol] += 1
+        if self._stock_index[symbol] <= idx:
+            self._stock_index[symbol] = idx + 1
         self.get_logger().info("━━━ Sequence Completed ━━━")
 
     def _move_piece_between_slots(
@@ -658,7 +723,7 @@ class RobotController(Node):
             lambda: self._move_to(
                 target_joints, target_key, "place", goal_handle, fast
             ),
-            self._open_gripper,
+            self._open_gripper_at_target,
             lambda: self._move_to(
                 target_approach, f"{target_key}_app", "approach_target",
                 goal_handle, fast
@@ -729,11 +794,78 @@ class RobotController(Node):
             self._current_operation.update(updates)
         self._publish_operation_status()
 
+    def _context_source_slot(self, context: dict | None) -> str:
+        if not context:
+            return ""
+
+        mode = context.get("mode")
+        if mode == "move_piece":
+            return str(context.get("source_slot", ""))
+
+        if mode != "place_piece":
+            return ""
+
+        source_slot = str(context.get("source_slot", ""))
+        if source_slot:
+            return source_slot
+
+        symbol = str(context.get("symbol", "")).upper()
+        if symbol not in ("X", "O"):
+            return ""
+
+        stock_index = int(
+            context.get("stock_index", self._stock_index.get(symbol, 1))
+        )
+        zone = "storage2" if symbol == "O" else "storage1"
+        return f"{zone}_{stock_index - 1}"
+
+    def _context_target_slot(self, context: dict | None) -> str:
+        if not context:
+            return ""
+
+        mode = context.get("mode")
+        if mode == "move_piece":
+            return str(context.get("target_slot", ""))
+
+        if mode != "place_piece":
+            return ""
+
+        try:
+            cell_index = int(context.get("cell_index", -1))
+        except (TypeError, ValueError):
+            return ""
+        if 0 <= cell_index <= 8:
+            return f"board_{cell_index}"
+        return ""
+
+    def _context_target_released(self, context: dict | None) -> bool:
+        if not context:
+            return False
+        if context.get("mode") not in ("place_piece", "move_piece"):
+            return False
+        if self._context_may_hold_piece(context):
+            return False
+        try:
+            next_step = int(context.get("next_step", 0))
+        except (TypeError, ValueError):
+            return False
+        # Step 8 is the target open-gripper step in both move sequences.
+        return next_step >= 8
+
     def _publish_operation_status(self):
         if not hasattr(self, "_operation_pub"):
             return
         with self._operation_lock:
             payload = dict(self._current_operation)
+        context = self._resume_context
+        holding_piece = self._context_may_hold_piece(context) if context else False
+        source_slot = self._context_source_slot(context)
+        target_slot = self._context_target_slot(context)
+        payload["holding_piece"] = holding_piece
+        payload["held_source_slot"] = source_slot if holding_piece else ""
+        payload["piece_source_slot"] = source_slot
+        payload["piece_target_slot"] = target_slot
+        payload["target_released"] = self._context_target_released(context)
         payload["timestamp_ns"] = time.time_ns()
         payload["timestamp"] = time.time()
 
@@ -777,11 +909,17 @@ class RobotController(Node):
         if mode == "place_piece":
             symbol = str(context.get("symbol", "")).upper()
             cell_index = int(context.get("cell_index", -1))
-            stock_index = self._stock_index.get(symbol, 1)
-            source_key = (
-                f"pick_stock_{stock_index}" if symbol == "O"
-                else f"pick_stock_{stock_index}_X"
-            )
+            source_slot = str(context.get("source_slot", ""))
+            if source_slot:
+                source_key = self._slot_to_position_key(source_slot)
+            else:
+                stock_index = int(
+                    context.get("stock_index", self._stock_index.get(symbol, 1))
+                )
+                source_key = (
+                    f"pick_stock_{stock_index}" if symbol == "O"
+                    else f"pick_stock_{stock_index}_X"
+                )
             target_key = f"cell_{cell_index}" if 0 <= cell_index <= 8 else None
             return source_key, target_key
 
@@ -822,7 +960,24 @@ class RobotController(Node):
             return source_key
         return None
 
-    def _recover_interrupted_context_before_home(self) -> bool:
+    def _resume_held_piece_from_home_next(self):
+        context = self._resume_context
+        if not context or not self._context_may_hold_piece(context):
+            return
+        if context.get("mode") not in ("place_piece", "move_piece"):
+            return
+
+        context["next_step"] = 6
+        context["holding_piece"] = True
+        self.get_logger().info(
+            "Held piece is now at HOME; resume will continue from target approach."
+        )
+        self._publish_operation_status()
+
+    def _recover_interrupted_context_before_home(
+        self,
+        hold_piece_for_validation: bool = False,
+    ) -> bool:
         context = self._resume_context
         if not context:
             return False
@@ -848,6 +1003,14 @@ class RobotController(Node):
                 return False
 
             if holding_piece:
+                if hold_piece_for_validation:
+                    self.get_logger().warning(
+                        "HOME requested while the gripper may hold a piece; "
+                        "keeping it in the gripper for external vision "
+                        "validation before it is returned."
+                    )
+                    return True
+
                 self.get_logger().warning(
                     "HOME requested while the gripper may hold a piece; "
                     "returning it to the source slot before going home."
@@ -883,18 +1046,90 @@ class RobotController(Node):
             )
             return False
 
-    def go_home(self):
+    def _return_held_piece_to_source(self, context: dict) -> bool:
+        if not self._context_may_hold_piece(context):
+            return False
+
+        source_key, _target_key = self._context_motion_keys(context)
+        if source_key is None or source_key not in self.positions:
+            return False
+
+        self.get_logger().warning(
+            "Returning held interrupted piece to its validated source slot."
+        )
+        source_joints = self.positions[source_key]
+        source_approach = _apply_approach(source_joints)
+        self._move_to(
+            source_approach,
+            f"{source_key}_app",
+            "return_held_approach_source",
+            goal_handle=None,
+        )
+        self._move_to(
+            source_joints,
+            source_key,
+            "return_held_piece",
+            goal_handle=None,
+        )
+        self._open_gripper()
+        self._move_to(
+            source_approach,
+            f"{source_key}_app",
+            "return_held_leave_source",
+            goal_handle=None,
+        )
+        return True
+
+    def return_held_piece_home(self, reset_stock: bool = True):
+        home_joints = self.positions["home"]
+        self._cancel_requested.clear()
+        try:
+            context = self._resume_context
+            if context and not self._return_held_piece_to_source(context):
+                raise RuntimeError(
+                    "Cannot return held piece: interrupted source slot is unknown."
+                )
+            self._resume_context = None
+            self._move_to(home_joints, "home", "return_home", goal_handle=None)
+            if reset_stock:
+                self._stock_index = {"X": 1, "O": 1}
+            self._publish_status("IDLE")
+        except _EmergencyStop:
+            self._publish_status("EMERGENCY_STOP")
+            raise
+        except Exception as e:
+            self.get_logger().error(f"return_held_piece_home failed: {e}")
+            self._publish_status("IDLE")
+            raise
+
+    def go_home(
+        self,
+        reset_stock: bool = True,
+        hold_piece_for_validation: bool = False,
+    ):
         """Move the robot home without a PlacePiece goal."""
         home_joints = self.positions["home"]
         self._cancel_requested.clear()
         try:
-            if self._recover_interrupted_context_before_home():
+            holding_for_validation = (
+                hold_piece_for_validation
+                and self._resume_context is not None
+                and self._context_may_hold_piece(self._resume_context)
+            )
+            if self._recover_interrupted_context_before_home(
+                hold_piece_for_validation=hold_piece_for_validation,
+            ):
                 # Once recovery has returned/released the piece, the old move
                 # must not be replayed if HOME is interrupted afterwards.
-                self._resume_context = None
+                if not holding_for_validation:
+                    self._resume_context = None
             self._move_to(home_joints, "home", "return_home", goal_handle=None)
-            self._stock_index = {"X": 1, "O": 1}
-            self._resume_context = None
+            if holding_for_validation:
+                self._resume_held_piece_from_home_next()
+            if reset_stock:
+                self._stock_index = {"X": 1, "O": 1}
+            if not holding_for_validation:
+                self._resume_context = None
             self._publish_status("IDLE")
         except _EmergencyStop:
             self._publish_status("EMERGENCY_STOP")
@@ -903,6 +1138,7 @@ class RobotController(Node):
             self.get_logger().error(f"go_home failed: {e}")
             self._resume_context = None
             self._publish_status("IDLE")
+            raise
 
 
 # ─────────────────────────────────────────────────────────────── exception

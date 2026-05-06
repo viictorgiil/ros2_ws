@@ -21,6 +21,7 @@ Corrected emergency-stop design:
 """
 
 import json
+import math
 import sys
 import threading
 import time
@@ -254,11 +255,16 @@ class GameNode(Node):
         self._restart_collection_interrupted = False
         self._restart_collection_plan: list[tuple[str, str, str]] = []
         self._restart_collection_next_index = 0
+        self._game_resume_validation_required = False
+        self._robot_turn_resume_state: dict | None = None
+        self._gui_shutdown_requested = False
         self._resume_lock = threading.Lock()
         self._resume_in_progress = False
         self._home_motion_active = False
         self._home_motion_interrupted = False
         self._home_motion_emit_reset = True
+        self._operation_status_lock = threading.Lock()
+        self._last_operation_status: dict = {}
         self._joint_state_lock = threading.Lock()
         self._last_joint_state: dict[str, float] = {}
         self._last_joint_state_at = 0.0
@@ -359,26 +365,41 @@ class GameNode(Node):
             self._last_joint_state = state
             self._last_joint_state_at = time.monotonic()
 
-    def _robot_is_currently_home(self, timeout: float = 1.0) -> bool:
+    @staticmethod
+    def _angular_distance(a: float, b: float) -> float:
+        return abs((a - b + math.pi) % (2.0 * math.pi) - math.pi)
+
+    def _robot_home_state(self, timeout: float = 1.0) -> bool | None:
         if self._home_joints is None:
-            return False
+            return None
 
         deadline = time.monotonic() + timeout
+        saw_complete_state = False
         while time.monotonic() < deadline and rclpy.ok():
+            now = time.monotonic()
             with self._joint_state_lock:
                 joint_state = dict(self._last_joint_state)
                 received_at = self._last_joint_state_at
 
-            if time.monotonic() - received_at <= 1.0 and all(
+            if now - received_at <= 1.0 and all(
                 joint in joint_state for joint in UR3_JOINTS
             ):
-                return all(
-                    abs(joint_state[joint] - expected) <= HOME_JOINT_TOLERANCE_RAD
+                saw_complete_state = True
+                if all(
+                    self._angular_distance(joint_state[joint], expected)
+                    <= HOME_JOINT_TOLERANCE_RAD
                     for joint, expected in zip(UR3_JOINTS, self._home_joints)
-                )
+                ):
+                    return True
             time.sleep(0.05)
 
-        return False
+        return False if saw_complete_state else None
+
+    def robot_home_state(self, timeout: float = 1.0) -> bool | None:
+        return self._robot_home_state(timeout=timeout)
+
+    def _robot_is_currently_home(self, timeout: float = 1.0) -> bool:
+        return self._robot_home_state(timeout=timeout) is True
 
     def start_game(
         self,
@@ -501,6 +522,14 @@ class GameNode(Node):
         3. Emit emergency_confirmed immediately so the GUI can react.
         """
         self.get_logger().warn(f"⛔ emergency_stop() activated: {cause}.")
+        self._game_resume_validation_required = (
+            self._game_started
+            and not self._restart_collection_active
+            and not self._home_motion_active
+            and self._ai_turn
+            and not self._teleop
+            and not self._move_was_completed
+        )
         self._game_started = False
         self._emergency_event.set()
         if self._restart_collection_active:
@@ -519,6 +548,26 @@ class GameNode(Node):
         self._bridge.emergency_confirmed.emit()
 
         # Do not touch _move_was_completed or _move_logic_applied here.
+
+    def request_gui_shutdown(self):
+        """Stop active work when the operator closes the main GUI window."""
+        if self._gui_shutdown_requested:
+            return
+        self._gui_shutdown_requested = True
+        self.get_logger().warn("GUI closed by operator; stopping active game work.")
+        self._startup_shutdown_requested = True
+        self._game_started = False
+        self._emergency_event.set()
+        self._vision_paused_event.set()
+        if self._restart_collection_active:
+            self._restart_collection_interrupted = True
+        if self._home_motion_active:
+            self._home_motion_interrupted = True
+
+        with self._goal_lock:
+            gh = self._active_goal_handle
+        if gh is not None:
+            gh.cancel_goal_async()
 
     def resume_after_emergency(self):
         """
@@ -605,7 +654,18 @@ class GameNode(Node):
         self._paused_for_vision = False
         self._vision_pause_expected_board = None
 
-        if self._require_vision:
+        resume_robot_turn_from_home = (
+            self._game_resume_validation_required
+            and not self._move_was_completed
+            and not self._move_logic_applied
+            and self._pending_symbol == self._game.ai_player
+        )
+
+        if resume_robot_turn_from_home:
+            if not self._prepare_interrupted_game_robot_turn_resume():
+                return
+            self._game_resume_validation_required = False
+        elif self._require_vision:
             expected_board = (
                 self._expected_board_with_move(
                     self._pending_cell_idx,
@@ -655,6 +715,321 @@ class GameNode(Node):
                 daemon=True,
             ).start()
 
+    def _capture_robot_turn_resume_state(self, planned_cell: int):
+        if not self._require_vision:
+            self._robot_turn_resume_state = None
+            return
+
+        with self._vision_lock:
+            state = dict(self._last_complete_vision_state or self._vision_state or {})
+
+        storage1 = list(state.get("storage1") or [])
+        storage2 = list(state.get("storage2") or [])
+        self._robot_turn_resume_state = {
+            "board": list(self._game.board),
+            "storage1": storage1 if len(storage1) == 5 else [],
+            "storage2": storage2 if len(storage2) == 5 else [],
+            "planned_cell": planned_cell,
+            "symbol": self._game.ai_player,
+            "captured_at": time.monotonic(),
+        }
+
+    def _current_held_source_slot(self) -> str | None:
+        with self._operation_status_lock:
+            status = dict(self._last_operation_status or {})
+        if not bool(status.get("holding_piece", False)):
+            return None
+        source_slot = str(status.get("held_source_slot", ""))
+        if self._slot_is_known(source_slot):
+            return source_slot
+        return None
+
+    def _current_released_target_motion(
+        self,
+    ) -> tuple[str | None, str | None]:
+        with self._operation_status_lock:
+            status = dict(self._last_operation_status or {})
+        if not bool(status.get("target_released", False)):
+            return None, None
+
+        source_slot = str(status.get("piece_source_slot", ""))
+        target_slot = str(status.get("piece_target_slot", ""))
+        return (
+            source_slot if self._slot_is_known(source_slot) else None,
+            target_slot if self._slot_is_known(target_slot) else None,
+        )
+
+    def _consume_dynamic_source_if_needed(
+        self,
+        symbol: str,
+        source_slot: str | None,
+    ):
+        if not self._use_dynamic_piece_sources or not source_slot:
+            return
+
+        slots = self._piece_source_slots.get(symbol, [])
+        if slots and slots[0] == source_slot:
+            slots.pop(0)
+            return
+        if source_slot in slots:
+            slots.remove(source_slot)
+
+    @staticmethod
+    def _slot_is_known(slot: str) -> bool:
+        try:
+            zone, raw_index = slot.rsplit("_", 1)
+            index = int(raw_index)
+        except ValueError:
+            return False
+        return (
+            (zone == "board" and 0 <= index <= 8)
+            or (zone in ("storage1", "storage2") and 0 <= index <= 4)
+        )
+
+    def _snapshot_with_slot_value(
+        self,
+        snapshot: dict,
+        slot: str | None,
+        value: str,
+    ) -> dict:
+        adjusted = {
+            "board": list(snapshot.get("board") or []),
+            "storage1": list(snapshot.get("storage1") or []),
+            "storage2": list(snapshot.get("storage2") or []),
+        }
+        if not slot:
+            return adjusted
+        try:
+            zone, raw_index = slot.rsplit("_", 1)
+            index = int(raw_index)
+        except ValueError:
+            return adjusted
+
+        cells = adjusted.get(zone)
+        if isinstance(cells, list) and 0 <= index < len(cells):
+            cells[index] = value
+        return adjusted
+
+    def _snapshot_with_empty_slot(self, snapshot: dict, slot: str | None) -> dict:
+        return self._snapshot_with_slot_value(snapshot, slot, " ")
+
+    def _prepare_interrupted_game_robot_turn_resume(self) -> bool:
+        if self._require_vision:
+            self._bridge.robot_status_changed.emit("VISION_PAUSED")
+            if not self._wait_for_robot_turn_visibility(
+                timeout=None,
+                pause_on_timeout=False,
+            ):
+                return False
+
+        self._set_vision_warning(
+            "Robot stopped during its turn. Returning HOME before checking "
+            "the physical board state."
+        )
+        held_source_before_home = self._current_held_source_slot()
+        released_source_before_home, released_target_before_home = (
+            self._current_released_target_motion()
+        )
+        self._bridge.robot_status_changed.emit("BUSY")
+        self._do_go_home(
+            emit_reset=False,
+            reset_stock=False,
+            hold_piece_for_validation=True,
+        )
+
+        if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+            return False
+        if self._home_motion_interrupted:
+            return False
+
+        released_source_after_home, released_target_after_home = (
+            self._current_released_target_motion()
+        )
+        released_source_slot = (
+            released_source_before_home or released_source_after_home
+        )
+        released_target_slot = (
+            released_target_before_home or released_target_after_home
+        )
+        target_was_released = bool(released_target_slot)
+
+        if not self._require_vision:
+            time.sleep(2.0)
+            if target_was_released:
+                self._consume_dynamic_source_if_needed(
+                    self._pending_symbol,
+                    released_source_slot,
+                )
+                self._move_was_completed = True
+            return True
+
+        snapshot = self._robot_turn_resume_state or {
+            "board": list(self._game.board),
+            "storage1": [],
+            "storage2": [],
+        }
+        if target_was_released:
+            snapshot = self._snapshot_with_empty_slot(
+                snapshot,
+                released_source_slot,
+            )
+            snapshot = self._snapshot_with_slot_value(
+                snapshot,
+                released_target_slot,
+                self._pending_symbol,
+            )
+        else:
+            snapshot = self._snapshot_with_empty_slot(
+                snapshot,
+                self._current_held_source_slot() or held_source_before_home,
+            )
+        fresh_after = time.monotonic()
+        self._publish_vision_mode("IDLE")
+        self._bridge.robot_status_changed.emit("VISION_PAUSED")
+        if not self._wait_for_robot_resume_state(snapshot, after=fresh_after):
+            return False
+
+        if target_was_released:
+            self._consume_dynamic_source_if_needed(
+                self._pending_symbol,
+                released_source_slot,
+            )
+            self._move_was_completed = True
+            self._set_vision_warning(
+                "Robot had already released the piece. Board state verified; "
+                "the game will register that move in 2 seconds."
+            )
+        else:
+            self._set_vision_warning(
+                "Board state verified. Robot will retry its turn in 2 seconds."
+            )
+        time.sleep(2.0)
+        self._set_vision_warning("")
+        return True
+
+    def _wait_for_robot_resume_state(self, snapshot: dict, after: float) -> bool:
+        last_message = ""
+        while rclpy.ok():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                return False
+
+            state = self._wait_for_stable_complete_vision_state(
+                after=after,
+                timeout=1.0,
+                stable_for=0.5,
+                reject_bad_pieces=True,
+            )
+            if state is None:
+                message = (
+                    "Waiting for stable vision before resuming. Restore the "
+                    "board and storage to the exact state from after the "
+                    "human move, before the robot moved."
+                )
+            elif self._resume_snapshot_matches(state, snapshot):
+                return True
+            else:
+                message = self._resume_snapshot_mismatch_message(state, snapshot)
+
+            if message != last_message:
+                self._set_vision_warning(message)
+                self.get_logger().warning(message)
+                last_message = message
+            time.sleep(0.1)
+
+        return False
+
+    def _wait_for_held_source_empty(self, source_slot: str, after: float) -> bool:
+        last_message = ""
+        while rclpy.ok():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                return False
+
+            state = self._wait_for_stable_complete_vision_state(
+                after=after,
+                timeout=1.0,
+                stable_for=0.5,
+                reject_bad_pieces=True,
+            )
+            if state is not None and self._slot_value(state, source_slot) == " ":
+                return True
+
+            current = self._slot_value(state or {}, source_slot) if state else None
+            current_label = (
+                self._cell_label(current) if current is not None else "unknown"
+            )
+            message = (
+                "Robot is holding a piece that must be returned before restart. "
+                f"Empty {source_slot}; vision currently sees "
+                f"{current_label} there."
+            )
+            if message != last_message:
+                self._set_vision_warning(message)
+                self.get_logger().warning(message)
+                last_message = message
+            time.sleep(0.1)
+
+        return False
+
+    @staticmethod
+    def _resume_snapshot_matches(state: dict, snapshot: dict) -> bool:
+        expected_board = list(snapshot.get("board") or [])
+        board = list(state.get("board") or [])
+        if len(expected_board) == 9 and board != expected_board:
+            return False
+
+        for zone in ("storage1", "storage2"):
+            expected = list(snapshot.get(zone) or [])
+            current = list(state.get(zone) or [])
+            if len(expected) == 5 and current != expected:
+                return False
+
+        return True
+
+    @staticmethod
+    def _cell_label(value: str) -> str:
+        return value if value in ("X", "O") else "empty"
+
+    def _resume_snapshot_mismatch_message(self, state: dict, snapshot: dict) -> str:
+        expected_board = list(snapshot.get("board") or [])
+        board = list(state.get("board") or [])
+        mismatches = []
+
+        if len(expected_board) == 9 and len(board) == 9:
+            for index, (expected, current) in enumerate(zip(expected_board, board)):
+                if expected != current:
+                    mismatches.append(
+                        f"board_{index} expected "
+                        f"{self._cell_label(expected)}, got "
+                        f"{self._cell_label(current)}"
+                    )
+
+        for zone in ("storage1", "storage2"):
+            expected_values = list(snapshot.get(zone) or [])
+            current_values = list(state.get(zone) or [])
+            if len(expected_values) != 5 or len(current_values) != 5:
+                continue
+            for index, (expected, current) in enumerate(
+                zip(expected_values, current_values)
+            ):
+                if expected != current:
+                    mismatches.append(
+                        f"{zone}_{index} expected "
+                        f"{self._cell_label(expected)}, got "
+                        f"{self._cell_label(current)}"
+                    )
+
+        detail = "; ".join(mismatches[:3])
+        if len(mismatches) > 3:
+            detail += f"; +{len(mismatches) - 3} more"
+        if not detail:
+            detail = "vision still does not match the saved state"
+
+        return (
+            "Robot stopped during its turn. Restore the board and storage to "
+            "the exact state from after the human move, before the robot moved: "
+            f"{detail}."
+        )
+
     def go_home_and_reset(self):
         threading.Thread(target=self._go_home_and_reset_worker, daemon=True).start()
 
@@ -668,8 +1043,43 @@ class GameNode(Node):
                 pause_on_timeout=False,
             ):
                 return
+        self._emergency_event.clear()
+        self._vision_paused_event.clear()
+        self._paused_for_vision = False
+        self._vision_pause_expected_board = None
+        self._interrupted_by_vision = False
+        held_source_before_home = self._current_held_source_slot()
         self._bridge.robot_status_changed.emit("BUSY")
-        self._do_go_home(emit_reset=True)
+        self._do_go_home(
+            emit_reset=False,
+            reset_stock=False,
+            hold_piece_for_validation=True,
+        )
+
+        if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+            return
+        if self._home_motion_interrupted:
+            return
+
+        held_source_slot = self._current_held_source_slot() or held_source_before_home
+        if held_source_slot:
+            if self._require_vision:
+                self._publish_vision_mode("IDLE")
+                self._bridge.robot_status_changed.emit("VISION_PAUSED")
+                fresh_after = time.monotonic()
+                if not self._wait_for_held_source_empty(
+                    held_source_slot,
+                    after=fresh_after,
+                ):
+                    return
+
+            self._bridge.robot_status_changed.emit("BUSY")
+            if not self._return_held_piece_home(reset_stock=True):
+                return
+            self._bridge.reset_completed.emit()
+            return
+
+        self._do_go_home(emit_reset=True, reset_stock=True)
 
     def collect_board_and_reset(self):
         threading.Thread(target=self._do_collect_board_and_home, daemon=True).start()
@@ -690,6 +1100,8 @@ class GameNode(Node):
         self._restart_collection_next_index = 0
         self._home_motion_active = False
         self._home_motion_interrupted = False
+        self._game_resume_validation_required = False
+        self._robot_turn_resume_state = None
         self._set_vision_warning("")
         self._publish_turn_state()
 
@@ -742,6 +1154,8 @@ class GameNode(Node):
             self._game.make_move(cell, self._game.ai_player)
             self._bridge.move_completed.emit(cell)
             self._move_logic_applied = True
+            self._game_resume_validation_required = False
+            self._robot_turn_resume_state = None
             if not self._check_game_over():
                 self._begin_human_turn(wait_for_fresh_vision=True)
         else:
@@ -766,6 +1180,8 @@ class GameNode(Node):
 
         if not self._ai_turn:
             self._bridge.robot_placing_human.emit()
+        else:
+            self._bridge.ai_thinking.emit(cell)
 
         self._interrupted_by_vision = False
         ok = self._call_place_piece(symbol, cell)
@@ -782,6 +1198,8 @@ class GameNode(Node):
             self._game.make_move(cell, self._game.ai_player)
             self._bridge.move_completed.emit(cell)
             self._move_logic_applied = True
+            self._game_resume_validation_required = False
+            self._robot_turn_resume_state = None
             if not self._check_game_over():
                 self._begin_human_turn(wait_for_fresh_vision=True)
         else:
@@ -818,6 +1236,8 @@ class GameNode(Node):
             latency_ms = None
 
         data["latency_ms"] = latency_ms
+        with self._operation_status_lock:
+            self._last_operation_status = dict(data)
         self._bridge.operation_status_changed.emit(data)
 
     def _image_to_qimage(self, msg: Image) -> QImage | None:
@@ -2563,8 +2983,21 @@ class GameNode(Node):
 
     # ── movement sequences ─────────────────────────────────────────────
 
-    def _do_go_home(self, emit_reset: bool = True):
-        self.get_logger().info("🏠 Sending robot home...")
+    def _do_go_home(
+        self,
+        emit_reset: bool = True,
+        reset_stock: bool | None = None,
+        hold_piece_for_validation: bool = False,
+    ):
+        home_state = self._robot_home_state(timeout=0.25)
+        if home_state is True:
+            self.get_logger().info("🏠 Robot already at HOME; confirming controller state.")
+        elif home_state is False:
+            self.get_logger().info("🏠 Sending robot home...")
+        else:
+            self.get_logger().info("🏠 HOME command requested; joint state is not fresh.")
+        if reset_stock is None:
+            reset_stock = emit_reset
         self._home_motion_active = True
         self._home_motion_interrupted = False
         self._home_motion_emit_reset = emit_reset
@@ -2592,7 +3025,9 @@ class GameNode(Node):
 
             goal = PlacePiece.Goal()
             goal.symbol     = "HOME"
-            goal.cell_index = -1
+            goal.cell_index = (
+                -3 if hold_piece_for_validation else -2 if reset_stock else -1
+            )
 
             gh = None
             # The server may still be finishing the previous cancellation.
@@ -2667,6 +3102,60 @@ class GameNode(Node):
             else:
                 self._bridge.robot_status_changed.emit("IDLE")
                 self._publish_turn_state()
+
+    def _return_held_piece_home(self, reset_stock: bool = True) -> bool:
+        self.get_logger().info("Returning held piece to its source before HOME...")
+        self._robot_motion_active = True
+        self._publish_vision_mode("ROBOT")
+
+        try:
+            self._emergency_event.clear()
+            if not self._place_client.server_is_ready():
+                time.sleep(0.5)
+                return True
+
+            goal = PlacePiece.Goal()
+            goal.symbol = "RETURN_HELD_HOME"
+            goal.cell_index = -2 if reset_stock else -1
+
+            send_future = self._place_client.send_goal_async(goal)
+            while not send_future.done():
+                if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                    return False
+                time.sleep(0.05)
+
+            gh = send_future.result()
+            if not gh.accepted:
+                self.get_logger().error("RETURN_HELD_HOME goal rejected.")
+                return False
+
+            with self._goal_lock:
+                self._active_goal_handle = gh
+
+            result_future = gh.get_result_async()
+            while not result_future.done():
+                if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                    gh.cancel_goal_async()
+                    return False
+                time.sleep(0.05)
+
+            from action_msgs.msg import GoalStatus
+
+            result = result_future.result()
+            if result.status == GoalStatus.STATUS_CANCELED:
+                return False
+            if not result.result.success:
+                self.get_logger().error(
+                    f"RETURN_HELD_HOME failed: {result.result.message}"
+                )
+                return False
+            return True
+        finally:
+            with self._goal_lock:
+                self._active_goal_handle = None
+            self._robot_motion_active = False
+            self._bridge.robot_status_changed.emit("IDLE")
+            self._publish_turn_state()
 
     def _do_collect_board_and_home(self):
         self.get_logger().info(
@@ -2877,6 +3366,7 @@ class GameNode(Node):
         self._move_was_completed = False
         self._move_logic_applied = False
         self._interrupted_by_vision = False
+        self._capture_robot_turn_resume_state(move)
 
         ok = self._call_place_piece(self._game.ai_player, move)
         if not ok:
@@ -2895,6 +3385,8 @@ class GameNode(Node):
         self._game.make_move(move, self._game.ai_player)
         self._bridge.move_completed.emit(move)
         self._move_logic_applied = True
+        self._game_resume_validation_required = False
+        self._robot_turn_resume_state = None
 
         if not self._check_game_over():
             self._begin_human_turn(wait_for_fresh_vision=False)
@@ -3169,10 +3661,17 @@ def main(args=None):
         Called on the Qt thread when the robot reaches home.
         Destroy the active window and relaunch SetupDialog.
         """
+        if node._gui_shutdown_requested:
+            app.quit()
+            return
+
         old = _current_window[0]
         if old is not None:
             old._disconnect_bridge()
-            old.close()
+            if hasattr(old, "close_for_reset"):
+                old.close_for_reset()
+            else:
+                old.close()
             old.deleteLater()
             _current_window[0] = None
 
