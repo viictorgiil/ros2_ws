@@ -621,12 +621,6 @@ class GameNode(Node):
             self._paused_for_vision = False
             self._vision_pause_expected_board = None
             self._interrupted_by_vision = False
-            self._bridge.robot_status_changed.emit("VISION_PAUSED")
-            if self._require_vision and not self._wait_for_robot_turn_visibility(
-                timeout=None,
-                pause_on_timeout=False,
-            ):
-                return
             self._bridge.robot_status_changed.emit("BUSY")
             emit_reset = self._home_motion_emit_reset
             self._home_motion_interrupted = False
@@ -639,12 +633,6 @@ class GameNode(Node):
             self._paused_for_vision = False
             self._vision_pause_expected_board = None
             self._interrupted_by_vision = False
-            self._bridge.robot_status_changed.emit("VISION_PAUSED")
-            if self._require_vision and not self._wait_for_robot_turn_visibility(
-                timeout=None,
-                pause_on_timeout=False,
-            ):
-                return
             self._bridge.robot_status_changed.emit("BUSY")
             self._resume_restart_collection()
             return
@@ -675,12 +663,7 @@ class GameNode(Node):
                 else list(self._game.board)
             )
             if (self._ai_turn or self._teleop) and not self._move_was_completed:
-                self._bridge.robot_status_changed.emit("VISION_PAUSED")
-                if not self._wait_for_robot_turn_visibility(
-                    timeout=None,
-                    pause_on_timeout=False,
-                ):
-                    return
+                self._bridge.robot_status_changed.emit("BUSY")
             elif not self._wait_for_expected_board_or_pause(
                 expected_board,
                 "Restore the board to the exact state before resuming.",
@@ -814,14 +797,6 @@ class GameNode(Node):
         return self._snapshot_with_slot_value(snapshot, slot, " ")
 
     def _prepare_interrupted_game_robot_turn_resume(self) -> bool:
-        if self._require_vision:
-            self._bridge.robot_status_changed.emit("VISION_PAUSED")
-            if not self._wait_for_robot_turn_visibility(
-                timeout=None,
-                pause_on_timeout=False,
-            ):
-                return False
-
         self._set_vision_warning(
             "Robot stopped during its turn. Returning HOME before checking "
             "the physical board state."
@@ -1036,13 +1011,6 @@ class GameNode(Node):
     def _go_home_and_reset_worker(self):
         if not self._wait_for_motion_stop_before_resume():
             return
-        if self._require_vision:
-            self._bridge.robot_status_changed.emit("VISION_PAUSED")
-            if not self._wait_for_robot_turn_visibility(
-                timeout=None,
-                pause_on_timeout=False,
-            ):
-                return
         self._emergency_event.clear()
         self._vision_paused_event.clear()
         self._paused_for_vision = False
@@ -1320,10 +1288,13 @@ class GameNode(Node):
 
         self._update_vision_display_mode(state)
         warning_message = self._vision_warning_message(state.get("warning", ""))
+        robot_control_phase = (
+            self._robot_motion_active
+            or self._home_motion_active
+            or (self._ai_turn and self._game_started)
+        )
 
-        if state["hand_detected"] and (
-            self._robot_motion_active or (self._ai_turn and self._game_started)
-        ):
+        if state["hand_detected"] and robot_control_phase:
             self._set_vision_warning("Hand detected during robot turn.")
             if not self._emergency_event.is_set():
                 self.emergency_stop(cause="hand detected by vision")
@@ -1332,10 +1303,9 @@ class GameNode(Node):
         if (
             state["board_detection_paused"]
             and not state.get("board_detected", True)
-            and (self._robot_motion_active or (self._ai_turn and self._game_started))
+            and robot_control_phase
         ):
             self._set_vision_warning(warning_message)
-            self._pause_for_vision_loss()
             return
 
         if state["board_detection_paused"]:
@@ -1352,7 +1322,9 @@ class GameNode(Node):
 
         if not state["board_detected"]:
             self._set_vision_warning(warning_message)
-            if self._game_started or self._robot_motion_active:
+            if robot_control_phase:
+                return
+            if self._game_started:
                 self._pause_for_vision_loss()
             return
 
