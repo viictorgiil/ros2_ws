@@ -18,7 +18,7 @@ BRIDGE_PORT = 65432
 
 # ── YOLO model ──────────────────────────────────────────────────────────────────
 # El archivo debe estar en:
-#   ros2_ws/src/tictactoe_vision/tictactoe_vision/best.pt
+#   ros2_ws/src/tictactoe_vision/tictactoe_vision/best2.pt
 YOLO_MODEL_PATH = str(Path(__file__).with_name('best2.pt'))
 yolo_model = YOLO(YOLO_MODEL_PATH)
 

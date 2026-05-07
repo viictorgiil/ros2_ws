@@ -11,6 +11,7 @@ setup(
             'hand_landmarker.task',
             'best.pt',
             'best2.pt',
+            'best3.pt',
         ],
     },
     include_package_data=True,
