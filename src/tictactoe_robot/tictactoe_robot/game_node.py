@@ -54,6 +54,8 @@ GAME_TURN_TOPIC = "/tictactoe/game/turn"
 OPERATION_STATUS_TOPIC = "/robot_controller/operation_status"
 HUMAN_VISION_STABLE_SEC = 2.0
 HOME_JOINT_TOLERANCE_RAD = 0.08
+VISION_LOSS_START_GRACE_SEC = 1.0
+VISION_LOSS_DEBOUNCE_SEC = 0.75
 UR3_JOINTS = [
     "shoulder_pan_joint",
     "shoulder_lift_joint",
@@ -223,6 +225,7 @@ class GameNode(Node):
         self._pending_symbol: str = ""
         self._pending_cell_idx: int = -1
         self._interrupted_by_vision = False
+        self._vision_loss_emergency_pending = False
         self._vision_paused_event = threading.Event()
         self._paused_for_vision = False
         self._paused_game_started = False
@@ -248,6 +251,8 @@ class GameNode(Node):
         self._startup_operation_dialog: RobotOperationDialog | None = None
         self._robot_home_confirmed = False
         self._robot_motion_active = False
+        self._robot_motion_started_at = 0.0
+        self._vision_loss_started_at: float | None = None
         self._use_dynamic_piece_sources = False
         self._piece_source_slots: dict[str, list[str]] = {"X": [], "O": []}
         self._vision_pause_expected_board: list[str] | None = None
@@ -417,6 +422,7 @@ class GameNode(Node):
         self._emergency_event.clear()
         self._vision_paused_event.clear()
         self._interrupted_by_vision = False
+        self._vision_loss_emergency_pending = False
         self._move_was_completed = False
         self._move_logic_applied = False
         self._vision_pause_expected_board = None
@@ -522,6 +528,8 @@ class GameNode(Node):
         3. Emit emergency_confirmed immediately so the GUI can react.
         """
         self.get_logger().warn(f"⛔ emergency_stop() activated: {cause}.")
+        if "vision loss" in cause.lower():
+            self._vision_loss_emergency_pending = True
         self._game_resume_validation_required = (
             self._game_started
             and not self._restart_collection_active
@@ -642,6 +650,14 @@ class GameNode(Node):
         self._paused_for_vision = False
         self._vision_pause_expected_board = None
 
+        resume_vision_loss_from_home = (
+            self._vision_loss_emergency_pending
+            and not self._move_was_completed
+            and not self._move_logic_applied
+            and bool(self._pending_symbol)
+            and 0 <= self._pending_cell_idx <= 8
+            and (self._ai_turn or self._teleop)
+        )
         resume_robot_turn_from_home = (
             self._game_resume_validation_required
             and not self._move_was_completed
@@ -649,10 +665,16 @@ class GameNode(Node):
             and self._pending_symbol == self._game.ai_player
         )
 
-        if resume_robot_turn_from_home:
+        if resume_vision_loss_from_home:
+            if not self._prepare_interrupted_game_robot_turn_resume():
+                return
+            self._vision_loss_emergency_pending = False
+            self._game_resume_validation_required = False
+        elif resume_robot_turn_from_home:
             if not self._prepare_interrupted_game_robot_turn_resume():
                 return
             self._game_resume_validation_required = False
+            self._vision_loss_emergency_pending = False
         elif self._require_vision:
             expected_board = (
                 self._expected_board_with_move(
@@ -671,6 +693,9 @@ class GameNode(Node):
                 pause_on_timeout=False,
             ):
                 return
+
+        if self._move_was_completed or self._move_logic_applied:
+            self._vision_loss_emergency_pending = False
 
         self._game_started = True
         self._publish_turn_state()
@@ -798,8 +823,8 @@ class GameNode(Node):
 
     def _prepare_interrupted_game_robot_turn_resume(self) -> bool:
         self._set_vision_warning(
-            "Robot stopped during its turn. Returning HOME before checking "
-            "the physical board state."
+            "Robot stopped while moving. Returning HOME before checking "
+            "the physical state."
         )
         held_source_before_home = self._current_held_source_slot()
         released_source_before_home, released_target_before_home = (
@@ -858,6 +883,12 @@ class GameNode(Node):
                 snapshot,
                 self._current_held_source_slot() or held_source_before_home,
             )
+        self._bridge.robot_status_changed.emit("VISION_PAUSED")
+        if not self._wait_for_robot_turn_visibility(
+            timeout=None,
+            pause_on_timeout=False,
+        ):
+            return False
         fresh_after = time.monotonic()
         self._publish_vision_mode("IDLE")
         self._bridge.robot_status_changed.emit("VISION_PAUSED")
@@ -1000,7 +1031,7 @@ class GameNode(Node):
             detail = "vision still does not match the saved state"
 
         return (
-            "Robot stopped during its turn. Restore the board and storage to "
+            "Robot stopped while moving. Restore the board and storage to "
             "the exact state from after the human move, before the robot moved: "
             f"{detail}."
         )
@@ -1016,6 +1047,7 @@ class GameNode(Node):
         self._paused_for_vision = False
         self._vision_pause_expected_board = None
         self._interrupted_by_vision = False
+        self._vision_loss_emergency_pending = False
         held_source_before_home = self._current_held_source_slot()
         self._bridge.robot_status_changed.emit("BUSY")
         self._do_go_home(
@@ -1070,6 +1102,7 @@ class GameNode(Node):
         self._home_motion_interrupted = False
         self._game_resume_validation_required = False
         self._robot_turn_resume_state = None
+        self._vision_loss_emergency_pending = False
         self._set_vision_warning("")
         self._publish_turn_state()
 
@@ -1293,12 +1326,47 @@ class GameNode(Node):
             or self._home_motion_active
             or (self._ai_turn and self._game_started)
         )
+        marker_count = int(state.get("marker_count", 0))
+        vision_loss_stop_phase = (
+            not self._home_motion_active
+            and self._robot_motion_active
+            and (
+                (self._game_started and self._ai_turn and not self._teleop)
+                or self._teleop
+            )
+        )
 
         if state["hand_detected"] and robot_control_phase:
             self._set_vision_warning("Hand detected during robot turn.")
             if not self._emergency_event.is_set():
                 self.emergency_stop(cause="hand detected by vision")
             return
+
+        if not vision_loss_stop_phase or marker_count >= 2:
+            self._vision_loss_started_at = None
+        elif (
+            state["received_at"] - self._robot_motion_started_at
+            >= VISION_LOSS_START_GRACE_SEC
+        ):
+            if self._vision_loss_started_at is None:
+                self._vision_loss_started_at = state["received_at"]
+            elapsed = state["received_at"] - self._vision_loss_started_at
+            self._set_vision_warning(
+                "Vision unstable during robot movement: keep at least 2 "
+                "green markers visible."
+            )
+            if elapsed >= VISION_LOSS_DEBOUNCE_SEC:
+                self._set_vision_warning(
+                    "Vision loss during robot movement: fewer than 2 green "
+                    "markers are visible."
+                )
+                if not self._emergency_event.is_set():
+                    self.emergency_stop(
+                        cause=(
+                            "vision loss: fewer than 2 green board markers visible"
+                        )
+                    )
+                return
 
         if (
             state["board_detection_paused"]
@@ -1551,14 +1619,15 @@ class GameNode(Node):
                 "least 2 green board markers visible."
             )
         while (deadline is None or time.monotonic() < deadline) and rclpy.ok():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                return False
+
             with self._vision_lock:
                 state = dict(self._vision_state or {})
 
             if (
                 state
                 and state.get("received_at", 0.0) >= after
-                and state.get("board_detection_paused", False)
-                and state.get("board_detected", False)
                 and not state.get("hand_detected", False)
                 and int(state.get("marker_count", 0)) >= 2
             ):
@@ -2974,6 +3043,8 @@ class GameNode(Node):
         self._home_motion_interrupted = False
         self._home_motion_emit_reset = emit_reset
         self._robot_motion_active = True
+        self._robot_motion_started_at = time.monotonic()
+        self._vision_loss_started_at = None
         self._publish_vision_mode("ROBOT")
 
         try:
@@ -3068,6 +3139,7 @@ class GameNode(Node):
             with self._goal_lock:
                 self._active_goal_handle = None
             self._robot_motion_active = False
+            self._vision_loss_started_at = None
             self._home_motion_active = False
             if self._home_motion_interrupted:
                 self._bridge.robot_status_changed.emit("EMERGENCY_STOP")
@@ -3392,10 +3464,13 @@ class GameNode(Node):
         Return True on success, False on emergency or error.
         """
         self._robot_motion_active = True
+        self._robot_motion_started_at = time.monotonic()
+        self._vision_loss_started_at = None
         try:
             return self._call_place_piece_impl(symbol, cell_index)
         finally:
             self._robot_motion_active = False
+            self._vision_loss_started_at = None
 
     def _call_place_piece_impl(self, symbol: str, cell_index: int) -> bool:
         if (
@@ -3516,10 +3591,13 @@ class GameNode(Node):
         Used for startup sorting and reset cleanup.
         """
         self._robot_motion_active = True
+        self._robot_motion_started_at = time.monotonic()
+        self._vision_loss_started_at = None
         try:
             return self._call_move_piece_impl(source_slot, target_slot, fast)
         finally:
             self._robot_motion_active = False
+            self._vision_loss_started_at = None
 
     def _call_move_piece_impl(
         self,

@@ -248,7 +248,7 @@ class SetupDialog(QDialog):
 
         self._btn_normal = ToggleButton(
             "🤖  Normal",
-            "The user moves their own pieces",
+            "the user moves their own pieces",
             _ACCENT_GREEN,
             "3d",
         )
