@@ -296,6 +296,41 @@ class RobotController(Node):
             self._active_goal_handle = None
             return result
 
+        if symbol == "CLEAR_RESUME_CONTEXT":
+            self._resume_context = None
+            self.get_logger().info("Cleared interrupted movement resume context.")
+            goal_handle.succeed()
+            result.success = True
+            result.message = "Resume context cleared"
+            self._active_goal_handle = None
+            return result
+
+        if symbol.startswith("CONSUME_STOCK_"):
+            piece_symbol = symbol.removeprefix("CONSUME_STOCK_").upper()
+            source_index = int(cell_index)
+            if piece_symbol not in self._stock_index or not 0 <= source_index < STOCK_COUNT:
+                goal_handle.abort()
+                result.success = False
+                result.message = (
+                    f"Invalid stock consume request: {piece_symbol} "
+                    f"source_index={source_index}"
+                )
+                self._active_goal_handle = None
+                return result
+
+            next_index = source_index + 2  # storage index is 0-based; stock index is 1-based next piece.
+            if self._stock_index[piece_symbol] < next_index:
+                self._stock_index[piece_symbol] = next_index
+            self.get_logger().info(
+                f"Marked {piece_symbol} stock source {source_index} consumed; "
+                f"next index is {self._stock_index[piece_symbol]}."
+            )
+            goal_handle.succeed()
+            result.success = True
+            result.message = "Stock source consumed"
+            self._active_goal_handle = None
+            return result
+
         try:
             start_step = 0
             if (

@@ -56,6 +56,9 @@ HUMAN_VISION_STABLE_SEC = 2.0
 HOME_JOINT_TOLERANCE_RAD = 0.08
 VISION_LOSS_START_GRACE_SEC = 1.0
 VISION_LOSS_DEBOUNCE_SEC = 0.75
+FAILED_PICK_RETRY_DELAY_SEC = 5.0
+FAILED_PICK_MAX_RETRIES = 1
+FAILED_PICK_RETRY_VISION_GRACE_SEC = 3.0
 UR3_JOINTS = [
     "shoulder_pan_joint",
     "shoulder_lift_joint",
@@ -192,6 +195,7 @@ class RosSignalBridge(QObject):
     rectified_frame_ready = pyqtSignal(object)
     vision_warning_changed = pyqtSignal(str)
     vision_provisional_move = pyqtSignal(int)
+    robot_provisional_move = pyqtSignal(int, str)
     vision_display_mode_changed = pyqtSignal(str)
     board_cell_cleared = pyqtSignal(int)
     operation_status_changed = pyqtSignal(object)
@@ -224,6 +228,7 @@ class GameNode(Node):
         # STOP was pressed so it can be resumed if needed.
         self._pending_symbol: str = ""
         self._pending_cell_idx: int = -1
+        self._pending_source_slot: str | None = None
         self._interrupted_by_vision = False
         self._vision_loss_emergency_pending = False
         self._vision_paused_event = threading.Event()
@@ -253,6 +258,7 @@ class GameNode(Node):
         self._robot_motion_active = False
         self._robot_motion_started_at = 0.0
         self._vision_loss_started_at: float | None = None
+        self._vision_loss_grace_until = 0.0
         self._use_dynamic_piece_sources = False
         self._piece_source_slots: dict[str, list[str]] = {"X": [], "O": []}
         self._vision_pause_expected_board: list[str] | None = None
@@ -423,6 +429,7 @@ class GameNode(Node):
         self._vision_paused_event.clear()
         self._interrupted_by_vision = False
         self._vision_loss_emergency_pending = False
+        self._pending_source_slot = None
         self._move_was_completed = False
         self._move_logic_applied = False
         self._vision_pause_expected_board = None
@@ -633,7 +640,13 @@ class GameNode(Node):
             emit_reset = self._home_motion_emit_reset
             self._home_motion_interrupted = False
             self._do_go_home(emit_reset=emit_reset)
-            return
+            if (
+                emit_reset
+                or self._emergency_event.is_set()
+                or self._vision_paused_event.is_set()
+                or self._home_motion_interrupted
+            ):
+                return
 
         if self._restart_collection_interrupted:
             self._emergency_event.clear()
@@ -782,6 +795,81 @@ class GameNode(Node):
         if source_slot in slots:
             slots.remove(source_slot)
 
+    def _consume_default_source_if_needed(
+        self,
+        symbol: str,
+        source_slot: str | None,
+    ) -> bool:
+        if self._use_dynamic_piece_sources or not source_slot:
+            return True
+
+        try:
+            zone, raw_index = source_slot.rsplit("_", 1)
+            source_index = int(raw_index)
+        except ValueError:
+            return True
+
+        expected_zone = "storage1" if symbol == "X" else "storage2"
+        if zone != expected_zone or not 0 <= source_index <= 4:
+            return True
+
+        return self._send_controller_bookkeeping_goal(
+            f"CONSUME_STOCK_{symbol}",
+            source_index,
+            "stock consume",
+        )
+
+    def _finalize_verified_source(self, symbol: str):
+        source_slot = self._pending_source_slot
+        self._consume_dynamic_source_if_needed(symbol, source_slot)
+        if not self._consume_default_source_if_needed(symbol, source_slot):
+            self.get_logger().warning(
+                f"Could not confirm consumed source {source_slot} for {symbol}."
+            )
+
+    def _send_controller_bookkeeping_goal(
+        self,
+        symbol: str,
+        cell_index: int,
+        description: str,
+    ) -> bool:
+        if not self._place_client.server_is_ready():
+            return True
+
+        goal = PlacePiece.Goal()
+        goal.symbol = symbol
+        goal.cell_index = cell_index
+
+        future = self._place_client.send_goal_async(goal)
+        while not future.done():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                return False
+            self._process_qt_events_if_safe()
+            time.sleep(0.05)
+
+        gh = future.result()
+        if not gh.accepted:
+            self.get_logger().error(f"{description} goal rejected.")
+            return False
+
+        result_future = gh.get_result_async()
+        while not result_future.done():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                gh.cancel_goal_async()
+                return False
+            self._process_qt_events_if_safe()
+            time.sleep(0.05)
+
+        from action_msgs.msg import GoalStatus
+
+        result = result_future.result()
+        if result.status == GoalStatus.STATUS_CANCELED:
+            return False
+        if not result.result.success:
+            self.get_logger().error(result.result.message)
+            return False
+        return True
+
     @staticmethod
     def _slot_is_known(slot: str) -> bool:
         try:
@@ -856,10 +944,10 @@ class GameNode(Node):
         if not self._require_vision:
             time.sleep(2.0)
             if target_was_released:
-                self._consume_dynamic_source_if_needed(
-                    self._pending_symbol,
-                    released_source_slot,
+                self._pending_source_slot = (
+                    released_source_slot or self._pending_source_slot
                 )
+                self._finalize_verified_source(self._pending_symbol)
                 self._move_was_completed = True
             return True
 
@@ -892,14 +980,48 @@ class GameNode(Node):
         fresh_after = time.monotonic()
         self._publish_vision_mode("IDLE")
         self._bridge.robot_status_changed.emit("VISION_PAUSED")
-        if not self._wait_for_robot_resume_state(snapshot, after=fresh_after):
+        failed_pick_source_slot = (
+            self._pending_source_slot
+            or self._current_held_source_slot()
+            or held_source_before_home
+        )
+        if not target_was_released and failed_pick_source_slot:
+            resume_state = self._wait_for_robot_resume_or_failed_pick_state(
+                snapshot,
+                after=fresh_after,
+                source_slot=failed_pick_source_slot,
+                target_slot=f"board_{self._pending_cell_idx}",
+                symbol=self._pending_symbol,
+            )
+            if resume_state == "failed_pick":
+                self._pending_source_slot = failed_pick_source_slot
+                if not self._retry_failed_pick_from_source(
+                    self._pending_cell_idx,
+                    self._pending_symbol,
+                ):
+                    return False
+                if (
+                    self._emergency_event.is_set()
+                    or self._vision_paused_event.is_set()
+                ):
+                    return False
+                self._move_was_completed = True
+                if not self._verify_completed_physical_move(
+                    self._pending_cell_idx,
+                    self._pending_symbol,
+                    max_failed_pick_retries=0,
+                ):
+                    return False
+                self._finalize_verified_source(self._pending_symbol)
+                return True
+            if resume_state != "matched":
+                return False
+        elif not self._wait_for_robot_resume_state(snapshot, after=fresh_after):
             return False
 
         if target_was_released:
-            self._consume_dynamic_source_if_needed(
-                self._pending_symbol,
-                released_source_slot,
-            )
+            self._pending_source_slot = released_source_slot or self._pending_source_slot
+            self._finalize_verified_source(self._pending_symbol)
             self._move_was_completed = True
             self._set_vision_warning(
                 "Robot had already released the piece. Board state verified; "
@@ -943,6 +1065,65 @@ class GameNode(Node):
             time.sleep(0.1)
 
         return False
+
+    def _wait_for_robot_resume_or_failed_pick_state(
+        self,
+        snapshot: dict,
+        after: float,
+        source_slot: str,
+        target_slot: str,
+        symbol: str,
+    ) -> str:
+        last_message = ""
+        while rclpy.ok():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                return "stopped"
+
+            state = self._wait_for_stable_complete_vision_state(
+                after=after,
+                timeout=1.0,
+                stable_for=0.5,
+                reject_bad_pieces=True,
+            )
+            if state is None:
+                message = (
+                    "Waiting for stable vision before resuming. Restore the "
+                    "board and storage to the exact state from after the "
+                    "human move, before the robot moved."
+                )
+            elif self._resume_snapshot_matches(state, snapshot):
+                return "matched"
+            elif (
+                (
+                    (
+                        self._robot_turn_resume_state is not None
+                        and self._resume_snapshot_matches(
+                            state,
+                            self._robot_turn_resume_state,
+                        )
+                    )
+                    or (
+                        self._robot_turn_resume_state is None
+                        and self._state_board_matches_expected(
+                            state,
+                            list(self._game.board),
+                        )
+                    )
+                )
+                and self._slot_value(state, target_slot) == " "
+                and self._slot_value(state, source_slot) == symbol
+            ):
+                return "failed_pick"
+            else:
+                message = self._resume_snapshot_mismatch_message(state, snapshot)
+
+            if message != last_message:
+                self._set_vision_warning(message)
+                self.get_logger().warning(message)
+                last_message = message
+            time.sleep(0.1)
+
+        return "stopped"
 
     def _wait_for_held_source_empty(self, source_slot: str, after: float) -> bool:
         last_message = ""
@@ -1103,6 +1284,7 @@ class GameNode(Node):
         self._game_resume_validation_required = False
         self._robot_turn_resume_state = None
         self._vision_loss_emergency_pending = False
+        self._pending_source_slot = None
         self._set_vision_warning("")
         self._publish_turn_state()
 
@@ -1152,6 +1334,7 @@ class GameNode(Node):
 
         if self._ai_turn:
             # It was the robot turn: apply logic and continue to the human
+            self._finalize_verified_source(self._game.ai_player)
             self._game.make_move(cell, self._game.ai_player)
             self._bridge.move_completed.emit(cell)
             self._move_logic_applied = True
@@ -1161,6 +1344,7 @@ class GameNode(Node):
                 self._begin_human_turn(wait_for_fresh_vision=True)
         else:
             # It was a teleop human piece: apply logic and pass to the robot
+            self._finalize_verified_source(self._game.human_player)
             self._game.make_move(cell, self._game.human_player)
             self._bridge.move_completed.emit(cell)
             self._move_logic_applied = True
@@ -1237,6 +1421,14 @@ class GameNode(Node):
             latency_ms = None
 
         data["latency_ms"] = latency_ms
+        source_slot = str(data.get("piece_source_slot", ""))
+        target_slot = str(data.get("piece_target_slot", ""))
+        if (
+            self._robot_motion_active
+            and self._slot_is_known(source_slot)
+            and target_slot == f"board_{self._pending_cell_idx}"
+        ):
+            self._pending_source_slot = source_slot
         with self._operation_status_lock:
             self._last_operation_status = dict(data)
         self._bridge.operation_status_changed.emit(data)
@@ -1347,6 +1539,7 @@ class GameNode(Node):
         elif (
             state["received_at"] - self._robot_motion_started_at
             >= VISION_LOSS_START_GRACE_SEC
+            and state["received_at"] >= self._vision_loss_grace_until
         ):
             if self._vision_loss_started_at is None:
                 self._vision_loss_started_at = state["received_at"]
@@ -3045,6 +3238,7 @@ class GameNode(Node):
         self._robot_motion_active = True
         self._robot_motion_started_at = time.monotonic()
         self._vision_loss_started_at = None
+        self._vision_loss_grace_until = 0.0
         self._publish_vision_mode("ROBOT")
 
         try:
@@ -3140,6 +3334,7 @@ class GameNode(Node):
                 self._active_goal_handle = None
             self._robot_motion_active = False
             self._vision_loss_started_at = None
+            self._vision_loss_grace_until = 0.0
             self._home_motion_active = False
             if self._home_motion_interrupted:
                 self._bridge.robot_status_changed.emit("EMERGENCY_STOP")
@@ -3368,6 +3563,7 @@ class GameNode(Node):
         self._last_human_cell  = cell_index
         self._pending_symbol   = self._game.human_player
         self._pending_cell_idx = cell_index
+        self._pending_source_slot = None
         self._move_was_completed = False
         self._move_logic_applied = False
         self._interrupted_by_vision = False
@@ -3386,9 +3582,13 @@ class GameNode(Node):
             return
 
         self._move_was_completed = True
-        if not self._verify_completed_physical_move(cell_index, self._game.human_player):
+        if not self._verify_completed_physical_move(
+            cell_index,
+            self._game.human_player,
+        ):
             return
 
+        self._finalize_verified_source(self._game.human_player)
         self._game.make_move(cell_index, self._game.human_player)
         self._bridge.move_completed.emit(cell_index)
         self._move_logic_applied = True
@@ -3407,6 +3607,7 @@ class GameNode(Node):
 
         self._pending_symbol   = self._game.ai_player
         self._pending_cell_idx = move
+        self._pending_source_slot = None
         self._move_was_completed = False
         self._move_logic_applied = False
         self._interrupted_by_vision = False
@@ -3424,6 +3625,7 @@ class GameNode(Node):
         if not self._verify_completed_physical_move(move, self._game.ai_player):
             return
 
+        self._finalize_verified_source(self._game.ai_player)
         # Apply game logic. If emergency arrives between _move_was_completed
         # and _move_logic_applied, resume logic will handle the gap.
         self._game.make_move(move, self._game.ai_player)
@@ -3435,17 +3637,213 @@ class GameNode(Node):
         if not self._check_game_over():
             self._begin_human_turn(wait_for_fresh_vision=False)
 
-    def _verify_completed_physical_move(self, cell_index: int, symbol: str) -> bool:
+    def _completed_move_vision_status(
+        self,
+        cell_index: int,
+        symbol: str,
+        warning: str,
+    ) -> str:
         if not self._require_vision:
-            return True
+            return "ok"
 
         expected_board = self._expected_board_with_move(cell_index, symbol)
-        return self._wait_for_expected_board_or_pause(
-            expected_board,
-            "Robot movement finished, but vision does not see the expected "
-            "board state. Restore the piece before resuming.",
+        before_board = list(self._game.board)
+        target_slot = f"board_{cell_index}"
+        source_slot = self._pending_source_slot
+
+        fresh_after = time.monotonic()
+        self._publish_vision_mode("IDLE")
+        state = self._wait_for_stable_complete_vision_state(
+            after=fresh_after,
             timeout=5.0,
+            stable_for=0.8,
+            reject_bad_pieces=True,
         )
+
+        if state is not None and self._state_board_matches_expected(
+            state,
+            expected_board,
+        ):
+            self._bridge.robot_provisional_move.emit(-1, "")
+            self._set_vision_warning("")
+            return "ok"
+
+        self._bridge.robot_provisional_move.emit(cell_index, symbol)
+        self._set_vision_warning(
+            "Robot returned HOME, but vision does not see the planned piece. "
+            "Rechecking before deciding whether to retry."
+        )
+        fresh_after = time.monotonic()
+        state = self._wait_for_stable_complete_vision_state(
+            after=fresh_after,
+            timeout=2.5,
+            stable_for=0.8,
+            reject_bad_pieces=True,
+        )
+
+        if state is not None and self._state_board_matches_expected(
+            state,
+            expected_board,
+        ):
+            self._bridge.robot_provisional_move.emit(-1, "")
+            self._set_vision_warning("")
+            return "ok"
+
+        failed_pick_snapshot = self._robot_turn_resume_state
+        failed_pick_state_ok = (
+            self._resume_snapshot_matches(state, failed_pick_snapshot)
+            if state is not None and failed_pick_snapshot is not None
+            else state is not None
+            and self._state_board_matches_expected(state, before_board)
+        )
+        if (
+            state is not None
+            and source_slot
+            and failed_pick_state_ok
+            and self._slot_value(state, target_slot) == " "
+            and self._slot_value(state, source_slot) == symbol
+        ):
+            return "failed_pick"
+
+        self._set_vision_warning(warning)
+        self._pause_for_vision_loss(expected_board=expected_board)
+        return "mismatch"
+
+    def _delay_before_failed_pick_retry(self, cell_index: int, symbol: str) -> bool:
+        self._bridge.robot_provisional_move.emit(cell_index, symbol)
+        self._set_vision_warning(
+            "The robot appears not to have picked up the piece. The board is "
+            "unchanged, so the robot will retry the same path in 5 seconds."
+        )
+        deadline = time.monotonic() + FAILED_PICK_RETRY_DELAY_SEC
+        while time.monotonic() < deadline and rclpy.ok():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                return False
+            time.sleep(0.05)
+        self._set_vision_warning("")
+        self._bridge.robot_provisional_move.emit(-1, "")
+        return True
+
+    def _retry_failed_pick_from_source(self, cell_index: int, symbol: str) -> bool:
+        source_slot = self._pending_source_slot
+        target_slot = f"board_{cell_index}"
+        if not source_slot:
+            self._set_vision_warning(
+                "Robot did not place the piece, but the source slot could not "
+                "be identified. Manual recovery is required."
+            )
+            return False
+
+        if not self._delay_before_failed_pick_retry(cell_index, symbol):
+            return False
+
+        self._bridge.robot_status_changed.emit("VISION_PAUSED")
+        self._set_vision_warning(
+            "Checking camera before retrying the failed pick..."
+        )
+        if not self._wait_for_robot_turn_visibility(
+            timeout=5.0,
+            pause_on_timeout=False,
+        ):
+            self._set_vision_warning(
+                "Cannot retry yet: remove your hand and keep at least 2 green "
+                "markers visible."
+            )
+            self._move_was_completed = False
+            if not self._emergency_event.is_set():
+                self.emergency_stop(
+                    cause="vision loss before failed-pick retry"
+                )
+            return False
+
+        if not self._clear_robot_resume_context():
+            return False
+
+        self._vision_loss_grace_until = (
+            time.monotonic() + FAILED_PICK_RETRY_VISION_GRACE_SEC
+        )
+        self._bridge.robot_status_changed.emit("BUSY")
+        self._move_was_completed = False
+        return self._call_move_piece(source_slot, target_slot, fast=False)
+
+    def _clear_robot_resume_context(self) -> bool:
+        if not self._place_client.server_is_ready():
+            return True
+
+        goal = PlacePiece.Goal()
+        goal.symbol = "CLEAR_RESUME_CONTEXT"
+        goal.cell_index = 0
+
+        future = self._place_client.send_goal_async(goal)
+        while not future.done():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                return False
+            self._process_qt_events_if_safe()
+            time.sleep(0.05)
+
+        gh = future.result()
+        if not gh.accepted:
+            self.get_logger().error("CLEAR_RESUME_CONTEXT goal rejected.")
+            return False
+
+        result_future = gh.get_result_async()
+        while not result_future.done():
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                gh.cancel_goal_async()
+                return False
+            self._process_qt_events_if_safe()
+            time.sleep(0.05)
+
+        from action_msgs.msg import GoalStatus
+
+        result = result_future.result()
+        if result.status == GoalStatus.STATUS_CANCELED:
+            return False
+        if not result.result.success:
+            self.get_logger().error(result.result.message)
+            return False
+        return True
+
+    def _verify_completed_physical_move(
+        self,
+        cell_index: int,
+        symbol: str,
+        max_failed_pick_retries: int = FAILED_PICK_MAX_RETRIES,
+    ) -> bool:
+        warning = (
+            "Robot movement finished, but vision does not see the expected "
+            "board state. Restore the piece before resuming."
+        )
+        retries = 0
+        while rclpy.ok():
+            status = self._completed_move_vision_status(
+                cell_index,
+                symbol,
+                warning,
+            )
+            if status == "ok":
+                return True
+            if status != "failed_pick":
+                return False
+            if retries >= max_failed_pick_retries:
+                self._set_vision_warning(
+                    "The robot still did not pick up the piece after retrying. "
+                    "Manual recovery is required."
+                )
+                self._pause_for_vision_loss(
+                    expected_board=self._expected_board_with_move(cell_index, symbol)
+                )
+                return False
+
+            retries += 1
+            if not self._retry_failed_pick_from_source(cell_index, symbol):
+                return False
+            if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                self._move_was_completed = False
+                return False
+            self._move_was_completed = True
+
+        return False
 
     def _check_game_over(self) -> bool:
         if not self._game.game_over():
@@ -3466,11 +3864,14 @@ class GameNode(Node):
         self._robot_motion_active = True
         self._robot_motion_started_at = time.monotonic()
         self._vision_loss_started_at = None
+        grace_until = self._vision_loss_grace_until
         try:
             return self._call_place_piece_impl(symbol, cell_index)
         finally:
             self._robot_motion_active = False
             self._vision_loss_started_at = None
+            if self._vision_loss_grace_until == grace_until:
+                self._vision_loss_grace_until = 0.0
 
     def _call_place_piece_impl(self, symbol: str, cell_index: int) -> bool:
         if (
@@ -3571,14 +3972,12 @@ class GameNode(Node):
 
         source_slot = slots[0]
         target_slot = f"board_{cell_index}"
+        self._pending_source_slot = source_slot
         self.get_logger().info(
             f"Dynamic piece source: {symbol} from {source_slot} -> {target_slot}"
         )
 
-        ok = self._call_move_piece(source_slot, target_slot, fast=False)
-        if ok:
-            slots.pop(0)
-        return ok
+        return self._call_move_piece(source_slot, target_slot, fast=False)
 
     def _call_move_piece(
         self,
@@ -3593,11 +3992,14 @@ class GameNode(Node):
         self._robot_motion_active = True
         self._robot_motion_started_at = time.monotonic()
         self._vision_loss_started_at = None
+        grace_until = self._vision_loss_grace_until
         try:
             return self._call_move_piece_impl(source_slot, target_slot, fast)
         finally:
             self._robot_motion_active = False
             self._vision_loss_started_at = None
+            if self._vision_loss_grace_until == grace_until:
+                self._vision_loss_grace_until = 0.0
 
     def _call_move_piece_impl(
         self,

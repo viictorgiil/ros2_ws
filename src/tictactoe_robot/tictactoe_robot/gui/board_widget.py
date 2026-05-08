@@ -104,6 +104,10 @@ class CellButton(QPushButton):
     def is_empty(self) -> bool:
         return self._symbol == ""
 
+    @property
+    def is_provisional(self) -> bool:
+        return self._provisional
+
     def _apply_style(self):
         color = _symbol_color(self._symbol, self._provisional) if self._symbol else _TEXT
         self.setStyleSheet(f"""
@@ -360,6 +364,7 @@ class BoardWidget(QWidget):
         self._human_symbol  : str        = "X"
         self._ai_symbol     : str        = "O"
         self._pending_cell  : int | None = None
+        self._robot_pending_cell: int | None = None
         self._human_turn    : bool       = False
         self._teleop        : bool       = False   # initialized in reset()
         self._cells         : list[CellButton] = []
@@ -460,6 +465,7 @@ class BoardWidget(QWidget):
         self._ai_symbol    = ai_symbol
         self._teleop       = teleop
         self._pending_cell = None
+        self._robot_pending_cell = None
         self._human_turn   = False
 
         for btn in self._cells:
@@ -495,12 +501,15 @@ class BoardWidget(QWidget):
             btn.setEnabled(False)
 
     def on_move_completed(self, cell_index: int, symbol: str):
+        self._clear_robot_provisional()
         btn = self._cells[cell_index]
         btn.set_symbol(symbol, provisional=False)
         btn.lock()
 
     def clear_board_cell(self, cell_index: int):
         if 0 <= cell_index < len(self._cells):
+            if self._robot_pending_cell == cell_index:
+                self._robot_pending_cell = None
             btn = self._cells[cell_index]
             btn.clear()
             btn.setEnabled(False)
@@ -542,6 +551,26 @@ class BoardWidget(QWidget):
     def on_ai_thinking(self, cell: int):
         self._status_bar.set_turn(f"🤔 Robot thinking... → cell {cell}", _BLUE)
         self._show_active_stop_button()
+
+    def _clear_robot_provisional(self):
+        if self._robot_pending_cell is None:
+            return
+        btn = self._cells[self._robot_pending_cell]
+        if btn.is_provisional:
+            btn.clear()
+            btn.setEnabled(False)
+        self._robot_pending_cell = None
+
+    def on_robot_provisional_move(self, cell_index: int, symbol: str):
+        self._clear_robot_provisional()
+        if cell_index < 0 or cell_index >= len(self._cells):
+            return
+        btn = self._cells[cell_index]
+        if not btn.is_empty:
+            return
+        self._robot_pending_cell = cell_index
+        btn.set_symbol(symbol, provisional=True)
+        btn.setEnabled(False)
 
     def set_vision_warning(self, text: str):
         self._vision_warning.setText(text)
