@@ -11,8 +11,8 @@ PORT = 65432
 class BridgeNode(Node):
     def __init__(self):
         super().__init__('vision_bridge')
-        self.publisher = self.create_publisher(String, '/tictactoe/tablero', 10)
-        self.get_logger().info('Bridge iniciado, esperando conexión del nodo visión...')
+        self.publisher = self.create_publisher(String, '/tictactoe/board', 10)
+        self.get_logger().info('Bridge started, waiting for the connection with the vision node...')
         
         # Servidor socket en hilo separado
         self.thread = threading.Thread(target=self.servidor_socket)
