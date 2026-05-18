@@ -1,7 +1,6 @@
 from pathlib import Path
 import cv2
 from ultralytics import YOLO
-import socket
 import struct
 import json
 import time
@@ -9,12 +8,9 @@ import numpy as np
 import mediapipe as mp
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
-
-# ── Connections ─────────────────────────────────────────────────────────────────
-BRIDGE_HOST = 'localhost'
-BRIDGE_PORT = 65432
 
 # ── YOLO model ──────────────────────────────────────────────────────────────────
 # El archivo debe estar en:
@@ -54,7 +50,9 @@ _bad_piece_blink_visible = True
 
 ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
 RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
+VISION_STATE_TOPIC = "/tictactoe/board"
 GAME_TURN_TOPIC = "/tictactoe/game/turn"
+GAME_TURN_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 
 # ── Green marker detection ──────────────────────────────────────────────────────
@@ -630,10 +628,16 @@ class FramePublisher(Node):
         super().__init__("vision_frame_publisher")
         self._original_pub = self.create_publisher(Image, ORIGINAL_VIEW_TOPIC, 10)
         self._rectified_pub = self.create_publisher(Image, RECTIFIED_VIEW_TOPIC, 10)
+        self._state_pub = self.create_publisher(String, VISION_STATE_TOPIC, 10)
         self.game_mode = "IDLE"
         self.storage_layout = "DEFAULT"
         self.robot_turn_active = False
-        self.create_subscription(String, GAME_TURN_TOPIC, self._turn_callback, 10)
+        self.create_subscription(
+            String,
+            GAME_TURN_TOPIC,
+            self._turn_callback,
+            GAME_TURN_QOS,
+        )
 
     def _turn_callback(self, msg: String):
         parts = msg.data.upper().split(":", 1)
@@ -673,6 +677,11 @@ class FramePublisher(Node):
 
     def publish_rectified(self, frame):
         self._publish_frame(self._rectified_pub, frame)
+
+    def publish_state(self, state: dict):
+        msg = String()
+        msg.data = json.dumps(state)
+        self._state_pub.publish(msg)
 
 
 # ── MediaPipe ───────────────────────────────────────────────────────────────────
@@ -766,17 +775,6 @@ def main():
     for _ in range(15):
         cap.read()
 
-    bridge_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    while True:
-        try:
-            bridge_sock.connect((BRIDGE_HOST, BRIDGE_PORT))
-            break
-        except OSError:
-            print("Waiting for vision bridge...")
-            time.sleep(0.5)
-
-    print("Bridge OK")
-
     rclpy.init()
     frame_pub = FramePublisher()
 
@@ -821,10 +819,12 @@ def main():
         except cv2.error:
             pass
 
-    def send_bridge_state(state):
+    def send_vision_state(state, marker_count_value=None):
         nonlocal last_status_state, last_status_sent_at
 
         state = {**state, "timestamp": time.time()}
+        if marker_count_value is not None and "marker_count" not in state:
+            state["marker_count"] = marker_count_value
         comparable = {k: v for k, v in state.items() if k != "timestamp"}
         now = time.monotonic()
 
@@ -837,10 +837,7 @@ def main():
         last_status_state = comparable
         last_status_sent_at = now
 
-        try:
-            bridge_sock.sendall((json.dumps(state) + "\n").encode())
-        except OSError as exc:
-            print(f"Vision bridge send failed: {exc}")
+        frame_pub.publish_state(state)
 
     try:
         while True:
@@ -888,7 +885,7 @@ def main():
                     )
                 )
 
-                send_bridge_state({
+                send_vision_state({
                     "board_detection_paused": True,
                     "board_detected": board_visible,
                     "hand_detected": hand,
@@ -911,11 +908,11 @@ def main():
                     publish_rectified_placeholder(frame, "HAND DETECTED - waiting...")
                 )
 
-                send_bridge_state({
+                send_vision_state({
                     "board_detected": detection_failures < MAX_FAILURES,
                     "hand_detected": True,
                     "warning": "HAND_DETECTED",
-                })
+                }, marker_count)
 
                 show_window("Original View", original_view, False)
                 show_window("Rectified View", None, False)
@@ -940,7 +937,7 @@ def main():
                             "BOARD MARKERS OCCLUDED - WAITING"
                         )
                     )
-                    send_bridge_state({
+                    send_vision_state({
                         "board_detection_paused": True,
                         "board_detected": False,
                         "hand_detected": False,
@@ -1018,7 +1015,7 @@ def main():
                         "CAMERA MOVED - RECALIBRATING"
                     )
                 )
-                send_bridge_state({
+                send_vision_state({
                     "board_detection_paused": True,
                     "board_detected": False,
                     "hand_detected": False,
@@ -1053,11 +1050,11 @@ def main():
                     publish_rectified_placeholder(original_view, "BOARD NOT DETECTED")
                 )
 
-                send_bridge_state({
+                send_vision_state({
                     "board_detected": False,
                     "hand_detected": False,
                     "warning": "BOARD_NOT_DETECTED",
-                })
+                }, marker_count)
 
                 show_window(
                     "Original View",
@@ -1092,7 +1089,7 @@ def main():
                         draw_zone(debug, cells_s2, res_s2, (0, 200, 255))
                         frame_pub.publish_original(original_view)
                         frame_pub.publish_rectified(debug)
-                        send_bridge_state({
+                        send_vision_state({
                             "board_detection_paused": True,
                             "board_detected": False,
                             "hand_detected": False,
@@ -1135,7 +1132,7 @@ def main():
                     print(f"Storage2: {res_s2}")
 
                     last_state = estado_cmp
-                send_bridge_state(estado)
+                send_vision_state(estado, marker_count)
 
                 debug = rect.copy()
                 draw_zone_lines(debug)
@@ -1151,11 +1148,11 @@ def main():
                     publish_rectified_placeholder(original_view, "SEARCHING FOR BOARD")
                 )
 
-                send_bridge_state({
+                send_vision_state({
                     "board_detected": False,
                     "hand_detected": False,
                     "warning": "SEARCHING_FOR_BOARD",
-                })
+                }, marker_count)
 
             frame_pub.publish_original(original_view)
             show_window("Original View", original_view, False)
@@ -1169,7 +1166,6 @@ def main():
         rclpy.shutdown()
         detector.close()
         cap.release()
-        bridge_sock.close()
         cv2.destroyAllWindows()
 
 

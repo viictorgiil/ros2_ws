@@ -4,8 +4,7 @@ launch/tictactoe.launch.py
 Starts both ROS2 nodes:
   • robot_controller  — manages UR3 motion + Robotiq gripper
   • game_node         — terminal UI + Minimax AI
-  • bridge_node       — forwards vision board state from socket to ROS
-  • vision_node       — publishes original/rectified camera views
+  • vision_node       — publishes camera views and board state
 
 Usage:
     ros2 launch tictactoe_robot tictactoe.launch.py
@@ -34,7 +33,7 @@ def generate_launch_description():
     vision_arg = DeclareLaunchArgument(
         "vision",
         default_value="true",
-        description="Start vision camera publisher and vision bridge",
+        description="Start vision camera and board-state publisher",
     )
 
     robot_controller_node = Node(
@@ -57,14 +56,6 @@ def generate_launch_description():
         on_exit         = [Shutdown(reason="game_node exited")],
     )
 
-    vision_bridge_node = Node(
-        package    = "tictactoe_vision",
-        executable = "bridge_node",
-        name       = "vision_bridge",
-        output     = "screen",
-        condition  = IfCondition(LaunchConfiguration("vision")),
-    )
-
     vision_node = Node(
         package    = "tictactoe_vision",
         executable = "vision_node",
@@ -80,6 +71,5 @@ def generate_launch_description():
         LogInfo(msg="[TicTacToe] Launching robot_controller, game_node, and vision nodes..."),
         robot_controller_node,
         game_node,
-        vision_bridge_node,
         vision_node,
     ])

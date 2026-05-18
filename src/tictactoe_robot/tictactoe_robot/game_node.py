@@ -31,6 +31,7 @@ import rclpy
 from rclpy.node            import Node
 from rclpy.action          import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.qos             import DurabilityPolicy, QoSProfile
 from std_msgs.msg          import String
 from sensor_msgs.msg       import Image, JointState
 from tictactoe_interfaces.action import MovePiece, PlacePiece
@@ -51,6 +52,7 @@ ORIGINAL_VIEW_TOPIC = "/tictactoe/vision/original_view"
 RECTIFIED_VIEW_TOPIC = "/tictactoe/vision/rectified_view"
 VISION_STATE_TOPIC = "/tictactoe/board"
 GAME_TURN_TOPIC = "/tictactoe/game/turn"
+GAME_TURN_QOS = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 OPERATION_STATUS_TOPIC = "/robot_controller/operation_status"
 HUMAN_VISION_STABLE_SEC = 2.0
 HOME_JOINT_TOLERANCE_RAD = 0.08
@@ -274,6 +276,8 @@ class GameNode(Node):
         self._home_motion_active = False
         self._home_motion_interrupted = False
         self._home_motion_emit_reset = True
+        self._home_motion_reset_stock = True
+        self._home_motion_hold_piece_for_validation = False
         self._operation_status_lock = threading.Lock()
         self._last_operation_status: dict = {}
         self._joint_state_lock = threading.Lock()
@@ -327,7 +331,7 @@ class GameNode(Node):
             self._vision_state_callback,
             10,
         )
-        self._turn_pub = self.create_publisher(String, GAME_TURN_TOPIC, 10)
+        self._turn_pub = self.create_publisher(String, GAME_TURN_TOPIC, GAME_TURN_QOS)
         self.create_timer(0.25, self._vision_tick)
 
         ready = self._place_client.wait_for_server(timeout_sec=5.0)
@@ -537,7 +541,7 @@ class GameNode(Node):
         self.get_logger().warn(f"⛔ emergency_stop() activated: {cause}.")
         if "vision loss" in cause.lower():
             self._vision_loss_emergency_pending = True
-        self._game_resume_validation_required = (
+        resume_validation_required = (
             self._game_started
             and not self._restart_collection_active
             and not self._home_motion_active
@@ -545,6 +549,15 @@ class GameNode(Node):
             and not self._teleop
             and not self._move_was_completed
         )
+        if (
+            self._home_motion_active
+            and self._home_motion_hold_piece_for_validation
+        ):
+            resume_validation_required = (
+                resume_validation_required
+                or self._game_resume_validation_required
+            )
+        self._game_resume_validation_required = resume_validation_required
         self._game_started = False
         self._emergency_event.set()
         if self._restart_collection_active:
@@ -638,8 +651,14 @@ class GameNode(Node):
             self._interrupted_by_vision = False
             self._bridge.robot_status_changed.emit("BUSY")
             emit_reset = self._home_motion_emit_reset
+            reset_stock = self._home_motion_reset_stock
+            hold_piece_for_validation = self._home_motion_hold_piece_for_validation
             self._home_motion_interrupted = False
-            self._do_go_home(emit_reset=emit_reset)
+            self._do_go_home(
+                emit_reset=emit_reset,
+                reset_stock=reset_stock,
+                hold_piece_for_validation=hold_piece_for_validation,
+            )
             if (
                 emit_reset
                 or self._emergency_event.is_set()
@@ -1281,6 +1300,9 @@ class GameNode(Node):
         self._restart_collection_next_index = 0
         self._home_motion_active = False
         self._home_motion_interrupted = False
+        self._home_motion_emit_reset = True
+        self._home_motion_reset_stock = True
+        self._home_motion_hold_piece_for_validation = False
         self._game_resume_validation_required = False
         self._robot_turn_resume_state = None
         self._vision_loss_emergency_pending = False
@@ -3235,6 +3257,8 @@ class GameNode(Node):
         self._home_motion_active = True
         self._home_motion_interrupted = False
         self._home_motion_emit_reset = emit_reset
+        self._home_motion_reset_stock = reset_stock
+        self._home_motion_hold_piece_for_validation = hold_piece_for_validation
         self._robot_motion_active = True
         self._robot_motion_started_at = time.monotonic()
         self._vision_loss_started_at = None
