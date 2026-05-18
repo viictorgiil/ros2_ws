@@ -393,7 +393,7 @@ class RobotController(Node):
             phase="goal_received",
             target=target_slot,
             fast=fast,
-            motor_power_pct=self._motor_power(100.0 if fast else 60.0),
+            motor_power_pct=self._motor_power(70.0 if fast else 60.0),
         )
 
         result = MovePiece.Result()
@@ -533,7 +533,7 @@ class RobotController(Node):
         self.get_logger().info(f"  → Moving to '{label}'…")
         waypoint_time = FAST_WAYPOINT_TIME if fast else WAYPOINT_TIME
         sim_waypoint_time = FAST_SIM_WAYPOINT_TIME if fast else SIM_WAYPOINT_TIME
-        speed_percent = 100.0 if fast else 60.0
+        speed_percent = 70.0 if fast else 60.0
         self._set_operation(
             status="MOVING",
             phase=phase or label,

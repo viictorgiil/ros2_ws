@@ -270,6 +270,9 @@ class GameNode(Node):
         self._restart_collection_next_index = 0
         self._game_resume_validation_required = False
         self._robot_turn_resume_state: dict | None = None
+        self._robot_turn_resume_held_source_slot: str | None = None
+        self._robot_turn_resume_released_source_slot: str | None = None
+        self._robot_turn_resume_released_target_slot: str | None = None
         self._gui_shutdown_requested = False
         self._resume_lock = threading.Lock()
         self._resume_in_progress = False
@@ -757,7 +760,7 @@ class GameNode(Node):
 
     def _capture_robot_turn_resume_state(self, planned_cell: int):
         if not self._require_vision:
-            self._robot_turn_resume_state = None
+            self._clear_robot_turn_resume_tracking()
             return
 
         with self._vision_lock:
@@ -773,6 +776,28 @@ class GameNode(Node):
             "symbol": self._game.ai_player,
             "captured_at": time.monotonic(),
         }
+        self._robot_turn_resume_held_source_slot = None
+        self._robot_turn_resume_released_source_slot = None
+        self._robot_turn_resume_released_target_slot = None
+
+    def _clear_robot_turn_resume_tracking(self):
+        self._robot_turn_resume_state = None
+        self._robot_turn_resume_held_source_slot = None
+        self._robot_turn_resume_released_source_slot = None
+        self._robot_turn_resume_released_target_slot = None
+
+    def _remember_robot_turn_resume_slots(
+        self,
+        held_source_slot: str | None = None,
+        released_source_slot: str | None = None,
+        released_target_slot: str | None = None,
+    ):
+        if held_source_slot:
+            self._robot_turn_resume_held_source_slot = held_source_slot
+        if released_source_slot:
+            self._robot_turn_resume_released_source_slot = released_source_slot
+        if released_target_slot:
+            self._robot_turn_resume_released_target_slot = released_target_slot
 
     def _current_held_source_slot(self) -> str | None:
         with self._operation_status_lock:
@@ -933,9 +958,17 @@ class GameNode(Node):
             "Robot stopped while moving. Returning HOME before checking "
             "the physical state."
         )
-        held_source_before_home = self._current_held_source_slot()
+        held_source_before_home = (
+            self._current_held_source_slot()
+            or self._robot_turn_resume_held_source_slot
+        )
         released_source_before_home, released_target_before_home = (
             self._current_released_target_motion()
+        )
+        self._remember_robot_turn_resume_slots(
+            held_source_slot=held_source_before_home,
+            released_source_slot=released_source_before_home,
+            released_target_slot=released_target_before_home,
         )
         self._bridge.robot_status_changed.emit("BUSY")
         self._do_go_home(
@@ -952,11 +985,19 @@ class GameNode(Node):
         released_source_after_home, released_target_after_home = (
             self._current_released_target_motion()
         )
+        self._remember_robot_turn_resume_slots(
+            released_source_slot=released_source_after_home,
+            released_target_slot=released_target_after_home,
+        )
         released_source_slot = (
-            released_source_before_home or released_source_after_home
+            self._robot_turn_resume_released_source_slot
+            or released_source_before_home
+            or released_source_after_home
         )
         released_target_slot = (
-            released_target_before_home or released_target_after_home
+            self._robot_turn_resume_released_target_slot
+            or released_target_before_home
+            or released_target_after_home
         )
         target_was_released = bool(released_target_slot)
 
@@ -988,7 +1029,9 @@ class GameNode(Node):
         else:
             snapshot = self._snapshot_with_empty_slot(
                 snapshot,
-                self._current_held_source_slot() or held_source_before_home,
+                self._current_held_source_slot()
+                or self._robot_turn_resume_held_source_slot
+                or held_source_before_home,
             )
         self._bridge.robot_status_changed.emit("VISION_PAUSED")
         if not self._wait_for_robot_turn_visibility(
@@ -1002,6 +1045,7 @@ class GameNode(Node):
         failed_pick_source_slot = (
             self._pending_source_slot
             or self._current_held_source_slot()
+            or self._robot_turn_resume_held_source_slot
             or held_source_before_home
         )
         if not target_was_released and failed_pick_source_slot:
@@ -1304,7 +1348,7 @@ class GameNode(Node):
         self._home_motion_reset_stock = True
         self._home_motion_hold_piece_for_validation = False
         self._game_resume_validation_required = False
-        self._robot_turn_resume_state = None
+        self._clear_robot_turn_resume_tracking()
         self._vision_loss_emergency_pending = False
         self._pending_source_slot = None
         self._set_vision_warning("")
@@ -1361,7 +1405,7 @@ class GameNode(Node):
             self._bridge.move_completed.emit(cell)
             self._move_logic_applied = True
             self._game_resume_validation_required = False
-            self._robot_turn_resume_state = None
+            self._clear_robot_turn_resume_tracking()
             if not self._check_game_over():
                 self._begin_human_turn(wait_for_fresh_vision=True)
         else:
@@ -1406,7 +1450,7 @@ class GameNode(Node):
             self._bridge.move_completed.emit(cell)
             self._move_logic_applied = True
             self._game_resume_validation_required = False
-            self._robot_turn_resume_state = None
+            self._clear_robot_turn_resume_tracking()
             if not self._check_game_over():
                 self._begin_human_turn(wait_for_fresh_vision=True)
         else:
@@ -3656,7 +3700,7 @@ class GameNode(Node):
         self._bridge.move_completed.emit(move)
         self._move_logic_applied = True
         self._game_resume_validation_required = False
-        self._robot_turn_resume_state = None
+        self._clear_robot_turn_resume_tracking()
 
         if not self._check_game_over():
             self._begin_human_turn(wait_for_fresh_vision=False)
