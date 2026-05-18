@@ -35,18 +35,6 @@ class TicTacToe: #class instantiated in game_node.py as self._game
         self.ai_player:    str | None = None #the same for AI
         self.random_prob:  float      = 0.0   # default: Hard (perfect AI)
 
-    # ------------------------------------------------------------------ display
-
-    def board_string(self) -> str: #used primarily for debugging
-        """Return a printable representation of the board."""
-        b = self.board
-        rows = []
-        for i in range(0, 9, 3):
-            rows.append(f" {b[i]} | {b[i+1]} | {b[i+2]} ")
-            if i < 6:
-                rows.append("---+---+---")
-        return "\n".join(rows)
-
     # ------------------------------------------------------------------ queries
 
     def available_moves(self) -> list[int]: #returns a list of integers of the vacant positions
@@ -89,7 +77,6 @@ class TicTacToe: #class instantiated in game_node.py as self._game
 
     def minimax_ab(
         self,
-        depth: int,
         is_maximizing: bool,
         alpha: float,
         beta: float,
@@ -121,7 +108,7 @@ class TicTacToe: #class instantiated in game_node.py as self._game
                 self.board[move] = self.ai_player
                 #simulates the AI making a move on that square, 
                 #as a temporary simulation within the search tree
-                score = self.minimax_ab(depth + 1, False, alpha, beta) #recursive call to simulate the next turn
+                score = self.minimax_ab(False, alpha, beta) #recursive call to simulate the next turn
                 self.board[move] = " " #reverses the simulated move (backtracking)
                 best  = max(best, score) #saves the highest score found so far
                 alpha = max(alpha, best) #saves the highest score found so far
@@ -133,7 +120,7 @@ class TicTacToe: #class instantiated in game_node.py as self._game
             best = float("inf") #the worst case for a minimizer: positive infinite, because you want to lower the value
             for move in self.available_moves():
                 self.board[move] = self.human_player
-                score = self.minimax_ab(depth + 1, True, alpha, beta)
+                score = self.minimax_ab(True, alpha, beta)
                 self.board[move] = " "
                 best = min(best, score)
                 beta = min(beta, best) #represents the best value the minimizer can guarantee
@@ -154,7 +141,7 @@ class TicTacToe: #class instantiated in game_node.py as self._game
         best_move  = None
         for move in self.available_moves(): #test each of the AI's candidate moves
             self.board[move] = self.ai_player #temporarily insert the AI piece
-            score = self.minimax_ab(0, False, float("-inf"), float("inf"))
+            score = self.minimax_ab(False, float("-inf"), float("inf"))
             self.board[move] = " "
             if score > best_score:
                 best_score = score
