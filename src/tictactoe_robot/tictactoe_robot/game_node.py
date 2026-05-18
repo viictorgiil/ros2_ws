@@ -3493,26 +3493,10 @@ class GameNode(Node):
         collection_ok = True
 
         if self._require_vision:
-            plan = self._plan_finished_restart_collection(fresh_after)
-            if plan is None:
-                collection_ok = False
-                self._set_vision_warning(
-                    "Reset collection could not be planned. Sending robot home "
-                    "for safety."
-                )
-            elif not plan:
-                self.get_logger().info("No board pieces found for restart collection.")
-                self._set_vision_warning("")
-            else:
-                self._restart_collection_plan = list(plan)
-                ok = self._run_restart_collection_plan(
-                    plan,
-                    start_index=0,
-                    verify_current=True,
-                )
-                if ok is None:
-                    return
-                collection_ok = ok
+            ok = self._run_dynamic_restart_collection(fresh_after=fresh_after)
+            if ok is None:
+                return
+            collection_ok = ok
 
         if collection_ok:
             self._restart_collection_active = False
@@ -3524,6 +3508,90 @@ class GameNode(Node):
         else:
             self._restart_collection_active = False
             self._do_go_home(emit_reset=True)
+
+    def _restart_collection_has_in_flight_piece(self) -> bool:
+        _released_source, released_target = self._current_released_target_motion()
+        return self._current_held_source_slot() is not None or bool(released_target)
+
+    def _current_restart_collection_move(self) -> tuple[str, str, str] | None:
+        plan = list(self._restart_collection_plan)
+        if not plan:
+            return None
+        index = max(0, min(self._restart_collection_next_index, len(plan) - 1))
+        return plan[index]
+
+    def _run_dynamic_restart_collection(
+        self,
+        fresh_after: float | None = None,
+        initial_move: tuple[str, str, str] | None = None,
+    ) -> bool | None:
+        pending_move = initial_move
+        for attempt in range(30):
+            if pending_move is None:
+                plan = self._plan_finished_restart_collection(
+                    fresh_after if fresh_after is not None else time.monotonic()
+                )
+                fresh_after = None
+                if plan is None:
+                    self._set_vision_warning(
+                        "Reset collection could not be planned. Sending robot home "
+                        "for safety."
+                    )
+                    return False
+                if not plan:
+                    self.get_logger().info(
+                        "No board pieces found for restart collection."
+                    )
+                    self._set_vision_warning("")
+                    return True
+
+                self._restart_collection_plan = list(plan)
+                self._restart_collection_next_index = 0
+                source_slot, target_slot, symbol = plan[0]
+                remaining = len(plan)
+            else:
+                source_slot, target_slot, symbol = pending_move
+                pending_move = None
+                remaining = len(self._restart_collection_plan) or 1
+                self.get_logger().info(
+                    "Resuming in-flight restart collection move before "
+                    "replanning from vision."
+                )
+
+            self.get_logger().info(
+                "Collection move "
+                f"{attempt + 1} ({remaining} currently planned): "
+                f"{source_slot} -> {target_slot}"
+            )
+            self._publish_vision_mode("ROBOT")
+            if not self._call_move_piece(source_slot, target_slot, fast=True):
+                self._publish_vision_mode("IDLE")
+                if self._emergency_event.is_set() or self._vision_paused_event.is_set():
+                    self._restart_collection_interrupted = True
+                    self._set_vision_warning(
+                        "Restart collection interrupted. Remove your hand and "
+                        "press Resume to continue collecting pieces."
+                    )
+                    self.get_logger().warning(
+                        "Restart collection interrupted; waiting for operator resume."
+                    )
+                    return None
+
+                self._set_vision_warning(
+                    "Reset collection failed. Sending robot home for safety."
+                )
+                return False
+
+            self._emit_board_cell_cleared_for_slot(source_slot)
+            self._publish_vision_mode("IDLE")
+            self._restart_collection_next_index += 1
+            self._wait_for_vision_after_move()
+
+        self.get_logger().error("Restart collection did not converge after 30 moves.")
+        self._set_vision_warning(
+            "Reset collection did not converge. Sending robot home for safety."
+        )
+        return False
 
     def _run_restart_collection_plan(
         self,
@@ -3608,26 +3676,25 @@ class GameNode(Node):
         return False
 
     def _resume_restart_collection(self):
-        plan = list(self._restart_collection_plan)
-        if not plan:
-            self.get_logger().error("Cannot resume restart collection: no plan saved.")
-            self._restart_collection_interrupted = False
-            return
-
-        start_index = max(0, min(self._restart_collection_next_index, len(plan)))
-        self.get_logger().info(
-            f"Resuming restart collection from move {start_index + 1}/{len(plan)}."
-        )
         self._restart_collection_active = True
         self._restart_collection_interrupted = False
         self._set_vision_warning("Resuming restart collection...")
 
-        ok = self._run_restart_collection_plan(
-            plan,
-            start_index=start_index,
-            verify_current=False,
-            skip_initial_verification=True,
-        )
+        initial_move = None
+        if self._restart_collection_has_in_flight_piece():
+            initial_move = self._current_restart_collection_move()
+            if initial_move is None:
+                self.get_logger().error(
+                    "Cannot resume in-flight restart collection: no move saved."
+                )
+                self._restart_collection_interrupted = False
+                return
+        else:
+            self.get_logger().info(
+                "Restart collection will replan from current vision state."
+            )
+
+        ok = self._run_dynamic_restart_collection(initial_move=initial_move)
         if ok is None:
             return
 
