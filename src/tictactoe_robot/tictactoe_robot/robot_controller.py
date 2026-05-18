@@ -47,8 +47,10 @@ from ament_index_python.packages import get_package_share_directory
 # ─────────────────────────────────────────────────────────────── constants
 
 APPROACH_OFFSET = [-0.007, +0.1311, +0.2004, -0.3277, 0.0, 0.0]
+NORMAL_SPEED_PERCENT = 60.0
+FAST_SPEED_PERCENT = 70.0
 WAYPOINT_TIME   = 2.5
-FAST_WAYPOINT_TIME = 1.5
+FAST_WAYPOINT_TIME = WAYPOINT_TIME * NORMAL_SPEED_PERCENT / FAST_SPEED_PERCENT
 GRIPPER_WAIT    = 1.0
 STOCK_COUNT     = 5
 
@@ -65,7 +67,7 @@ UR3_JOINTS = [
 ]
 
 SIM_WAYPOINT_TIME = 0.5
-FAST_SIM_WAYPOINT_TIME = 0.25
+FAST_SIM_WAYPOINT_TIME = SIM_WAYPOINT_TIME * NORMAL_SPEED_PERCENT / FAST_SPEED_PERCENT
 SIM_GRIPPER_TIME  = 0.1
 UR_CANCEL_SETTLE_TIMEOUT = 3.0
 UR_RESULT_TIMEOUT_MARGIN = 20.0
@@ -236,7 +238,7 @@ class RobotController(Node):
             phase="goal_received",
             target="home" if symbol == "HOME" else f"cell_{cell_index}",
             fast=False,
-            motor_power_pct=self._motor_power(60.0),
+            motor_power_pct=self._motor_power(NORMAL_SPEED_PERCENT),
         )
 
         result = PlacePiece.Result()
@@ -393,7 +395,9 @@ class RobotController(Node):
             phase="goal_received",
             target=target_slot,
             fast=fast,
-            motor_power_pct=self._motor_power(70.0 if fast else 60.0),
+            motor_power_pct=self._motor_power(
+                FAST_SPEED_PERCENT if fast else NORMAL_SPEED_PERCENT
+            ),
         )
 
         result = MovePiece.Result()
@@ -533,7 +537,7 @@ class RobotController(Node):
         self.get_logger().info(f"  → Moving to '{label}'…")
         waypoint_time = FAST_WAYPOINT_TIME if fast else WAYPOINT_TIME
         sim_waypoint_time = FAST_SIM_WAYPOINT_TIME if fast else SIM_WAYPOINT_TIME
-        speed_percent = 70.0 if fast else 60.0
+        speed_percent = FAST_SPEED_PERCENT if fast else NORMAL_SPEED_PERCENT
         self._set_operation(
             status="MOVING",
             phase=phase or label,

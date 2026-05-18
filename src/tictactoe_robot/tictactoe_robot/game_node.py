@@ -58,6 +58,7 @@ HUMAN_VISION_STABLE_SEC = 2.0
 HOME_JOINT_TOLERANCE_RAD = 0.08
 VISION_LOSS_START_GRACE_SEC = 1.0
 VISION_LOSS_DEBOUNCE_SEC = 0.75
+HAND_DETECTION_DEBOUNCE_SEC = 0.25
 FAILED_PICK_RETRY_DELAY_SEC = 5.0
 FAILED_PICK_MAX_RETRIES = 1
 FAILED_PICK_RETRY_VISION_GRACE_SEC = 3.0
@@ -260,6 +261,7 @@ class GameNode(Node):
         self._robot_motion_active = False
         self._robot_motion_started_at = 0.0
         self._vision_loss_started_at: float | None = None
+        self._hand_detection_started_at: float | None = None
         self._vision_loss_grace_until = 0.0
         self._use_dynamic_piece_sources = False
         self._piece_source_slots: dict[str, list[str]] = {"X": [], "O": []}
@@ -1595,10 +1597,22 @@ class GameNode(Node):
         )
 
         if state["hand_detected"] and robot_control_phase:
+            if self._hand_detection_started_at is None:
+                self._hand_detection_started_at = state["received_at"]
             self._set_vision_warning("Hand detected during robot turn.")
-            if not self._emergency_event.is_set():
+            hand_elapsed = state["received_at"] - self._hand_detection_started_at
+            hand_debounce = (
+                0.0
+                if self._game_started and (self._ai_turn or self._teleop)
+                else HAND_DETECTION_DEBOUNCE_SEC
+            )
+            if (
+                hand_elapsed >= hand_debounce
+                and not self._emergency_event.is_set()
+            ):
                 self.emergency_stop(cause="hand detected by vision")
             return
+        self._hand_detection_started_at = None
 
         if not vision_loss_stop_phase or marker_count >= 2:
             self._vision_loss_started_at = None
