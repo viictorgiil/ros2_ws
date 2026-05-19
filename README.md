@@ -248,11 +248,6 @@ The board uses row-major indexing:
 
 ## Robot Control
 
-The robot controller supports two modes:
-
-- `simulate:=false`: connects to the real UR3 action server and gripper I/O service.
-- `simulate:=true`: skips hardware communication and simulates robot movements.
-
 The controller uses calibrated joint positions stored in `positions.json`, including:
 
 - `home`
@@ -260,7 +255,7 @@ The controller uses calibrated joint positions stored in `positions.json`, inclu
 - `pick_stock_*`
 - `pick_stock_*_X`
 
-For real hardware usage, verify the physical board position, gripper configuration, camera calibration, and all joint targets before running the robot.
+For usage, verify the physical board position, gripper configuration, camera calibration, and all joint targets before running the robot.
 
 ## Safety and Emergency Stop
 
