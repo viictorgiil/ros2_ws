@@ -1,7 +1,7 @@
 # Adaptive Human–Robot Tic-Tac-Toe with ROS 2
 
 [![ROS 2](https://img.shields.io/badge/ROS%202-robotics-blue)](https://docs.ros.org/)
-[![Python](https://img.shields.io/badge/Python-3.x-green)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.12-green)](https://www.python.org/)
 [![UR3](https://img.shields.io/badge/Robot-UR3-orange)](#robot-control)
 
 This repository contains the ROS 2 workspace developed for the thesis project **“Integrating AI, Robotic Control and Teleoperation for Adaptive Human-Robot Gaming”**.
