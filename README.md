@@ -365,7 +365,7 @@ The `materials/` folder contains supporting thesis assets:
 
 ## Author
 
-**Víctor Gil**  
+**Víctor Gil** and **Jaime Verdú**  
 Thesis project repository: [viictorgiil/ros2_ws](https://github.com/viictorgiil/ros2_ws)
 
 ## License
