@@ -1,7 +1,7 @@
 # Adaptive Human–Robot Tic-Tac-Toe with ROS 2
 
-![Python](https://img.shields.io/badge/Python-3.10-FFD43B)
-![ROS 2](https://img.shields.io/badge/ROS%202-Humble-F57C00)
+[![Python](https://img.shields.io/badge/Python-3.12-FFD43B)](https://www.python.org/downloads/release/python-3120/)
+[![ROS 2](https://img.shields.io/badge/ROS%202-Jazzy-F57C00)](https://docs.ros.org/en/jazzy/)
 [![UR3 CB3](https://img.shields.io/badge/Robot-UR3%20CB3-0072CE)](https://cobots.se/shop/universal-robots/ur-robotarmar/ur3-robot/)
 
 This repository contains the ROS 2 workspace developed for the thesis project **“Integrating AI, Robotic Control and Teleoperation for Adaptive Human-Robot Gaming”**.
