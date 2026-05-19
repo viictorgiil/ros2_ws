@@ -2,7 +2,7 @@
 
 [![ROS 2](https://img.shields.io/badge/ROS%202-robotics-blue)](https://docs.ros.org/)
 [![Python](https://img.shields.io/badge/Python-3.12-green)](https://www.python.org/)
-[![UR3 CB3](https://cobots.se/shop/universal-robots/ur-robotarmar/ur3-robot/)](#robot-control)
+[![UR3 CB3](https://cobots.se/wp-content/uploads/2017/05/ur3-robot-flexible-table-top-robot-big__02727-510x499.webp)](#robot-control)
 
 This repository contains the ROS 2 workspace developed for the thesis project **“Integrating AI, Robotic Control and Teleoperation for Adaptive Human-Robot Gaming”**.
 
