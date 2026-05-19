@@ -18,12 +18,11 @@ A video demonstration of the system is available here:
 
 ## Main Features
 
-- **Human–robot tic-tac-toe gameplay** using a physical board and physical game pieces.
-- **AI opponent** based on Minimax with Alpha-Beta pruning.
+- **Human–robot Tic-Tac-Toe gameplay** using a physical board and physical game pieces.
+- **AI opponent** based on Alpha-Beta pruning.
 - **Adaptive difficulty**, allowing the robot to play optimally or introduce random moves depending on the selected level.
 - **ROS 2 architecture** split into robot, vision, and custom interface packages.
 - **UR3 robot control** through joint trajectory actions and gripper I/O.
-- **Simulation mode** for testing without the physical robot.
 - **Computer vision pipeline** using OpenCV, YOLO, and MediaPipe.
 - **Board rectification** through marker-based homography.
 - **Hand detection** to pause/avoid unsafe interaction while the user is manipulating the board.
@@ -71,8 +70,8 @@ Main gameplay and robot-control package.
 It includes:
 
 - `game_node.py`: central game coordinator, GUI bridge, turn management, vision validation, emergency stop handling, and action clients for robot motion.
-- `robot_controller.py`: ROS 2 action server that controls the UR3 robot and Robotiq gripper, or simulates movements when `simulate:=true`.
-- `tictactoe_game.py`: pure tic-tac-toe game engine with Minimax + Alpha-Beta pruning.
+- `robot_controller.py`: ROS 2 action server that controls the UR3 robot and Robotiq gripper.
+- `tictactoe_game.py`: pure Tic-Tac-Toe game engine with Alpha-Beta pruning.
 - `gui/`: PyQt6 interface for game setup, board display, status monitoring, emergency handling, and restart/shutdown flow.
 - `positions.json`: calibrated UR3 joint positions for board cells, stock positions, and home pose.
 
@@ -97,7 +96,6 @@ It defines:
 
 - `PlacePiece.action`: command the robot to place an `X` or `O` in a board cell.
 - `MovePiece.action`: move a physical piece between explicit board/storage slots.
-- `PlacePiece.srv`: service-style interface for piece placement requests.
 
 ## System Overview
 
