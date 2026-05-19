@@ -157,22 +157,6 @@ It defines:
 - UR robot ROS 2 control stack when running with the real UR3
 - A compatible USB camera for the vision node
 
-### Python dependencies
-
-The Python dependencies are listed in `requirements.txt`:
-
-```text
-PyQt6
-opencv-python
-numpy<2
-mediapipe
-ultralytics
-torch
-torchvision
-```
-
-Install them with:
-
 ```bash
 pip install -r requirements.txt
 ```
