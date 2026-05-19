@@ -156,6 +156,7 @@ It defines:
 - A working ROS 2 environment sourced in the terminal
 - UR robot ROS 2 control stack when running with the real UR3
 - A compatible USB camera for the vision node
+- Python dependencies. Install them with:
 
 ```bash
 pip install -r requirements.txt
