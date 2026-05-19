@@ -1,0 +1,7 @@
+PyQt6
+opencv-python
+numpy<2
+mediapipe
+ultralytics
+torch
+torchvision
