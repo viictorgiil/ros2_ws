@@ -1,4 +1,4 @@
-# Adaptive Human–Robot Tic-Tac-Toe with ROS 2
+# Integrating AI, Robotic Control and Teleoperation for Adaptative Human-Robot Gaming
 
 [![Python](https://img.shields.io/badge/Python-3.12-FFD43B)](https://www.python.org/downloads/release/python-3120/)
 [![ROS 2](https://img.shields.io/badge/ROS%202-Jazzy-F57C00)](https://docs.ros.org/en/jazzy/Installation.html)
