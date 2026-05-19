@@ -160,6 +160,12 @@ It defines:
 
 ## Installation
 
+Install UR3 Driver:
+
+```bash
+sudo apt install -y ros-jazzy-ur
+```
+
 Clone the workspace:
 
 ```bash
@@ -193,7 +199,16 @@ source install/setup.bash
 
 ## Running the System
 
-### Full system with robot and vision
+Launch the UR3 Driver:
+
+```bash
+ros2 launch ur_robot_driver ur_control.launch.py \
+    ur_type:=ur3 \
+    robot_ip:=192.168.0.10 \
+    use_fake_hardware:=false \
+    reverse_ip:=192.168.0.2 \
+    launch_rviz:=true
+```
 
 ```bash
 ros2 launch tictactoe_robot tictactoe.launch.py
@@ -204,28 +219,6 @@ This starts:
 - `robot_controller`
 - `game_node`
 - `vision_node`
-
-### Simulation mode
-
-Use this mode when the physical UR3 robot is not available:
-
-```bash
-ros2 launch tictactoe_robot tictactoe.launch.py simulate:=true
-```
-
-### Run without vision
-
-Use this when testing the game/robot logic without the camera pipeline:
-
-```bash
-ros2 launch tictactoe_robot tictactoe.launch.py vision:=false
-```
-
-### Simulation without vision
-
-```bash
-ros2 launch tictactoe_robot tictactoe.launch.py simulate:=true vision:=false
-```
 
 ## Vision Setup Notes
 
