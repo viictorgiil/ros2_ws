@@ -271,64 +271,19 @@ This software-level emergency stop is intended as a control-layer safety feature
 
 ## Game AI
 
-The tic-tac-toe AI is implemented in `tictactoe_game.py`.
+The Tic-Tac-Toe AI is implemented in `tictactoe_game.py`.
 
 It uses:
 
-- Minimax search
 - Alpha-Beta pruning
 - Score preference for faster wins and slower losses
 - A random-move probability parameter for adaptive difficulty
 
 The difficulty parameter controls how often the AI chooses a random valid move instead of the optimal move.
 
-## Development Tips
+## Notes
 
-Build only the custom interfaces after editing `.srv` or `.action` files:
-
-```bash
-colcon build --packages-select tictactoe_interfaces
-source install/setup.bash
-```
-
-Build the full workspace after modifying Python nodes:
-
-```bash
-colcon build
-source install/setup.bash
-```
-
-Inspect available ROS 2 interfaces:
-
-```bash
-ros2 interface show tictactoe_interfaces/action/PlacePiece
-ros2 interface show tictactoe_interfaces/action/MovePiece
-ros2 interface show tictactoe_interfaces/srv/PlacePiece
-```
-
-Monitor the board state:
-
-```bash
-ros2 topic echo /tictactoe/board
-```
-
-Monitor robot status:
-
-```bash
-ros2 topic echo /robot_controller/robot_status
-```
-
-## Materials
-
-The `materials/` folder contains supporting thesis assets:
-
-- `sdf_models/`: SDF files used for 3D object modelling.
-- `study_scripts/`: Python scripts used for experimental studies.
-
-## Known Notes
-
-- The project is currently configured for a specific physical setup, including camera path, board marker layout, UR3 joint positions, and storage-cell mapping.
-- Before using a different robot, board, camera, or lighting setup, recalibration is required.
+- The project is currently configured for a specific physical setup, including camera path, board marker layout, UR3 joint positions, and storage-cell mapping. Before using a different robot, board, camera, or lighting setup, recalibration is required.
 - The trained YOLO model file is packaged inside `tictactoe_vision` and is required for piece classification.
 - Real-hardware operation should only be performed in a controlled environment with proper supervision.
 
