@@ -6,7 +6,7 @@
 
 This repository contains the ROS 2 workspace developed for the thesis project **“Integrating AI, Robotic Control and Teleoperation for Adaptive Human-Robot Gaming”**.
 
-The system implements a physical human–robot tic-tac-toe game where a human player competes against an AI-controlled robot. It combines computer vision, game intelligence, a PyQt6 graphical interface, ROS 2 communication, and UR3 robotic manipulation to create an interactive adaptive gaming scenario.
+The system implements a physical human–robot Tic-Tac-Toe game where a human player competes against an AI-controlled robot. It combines computer vision, game intelligence, a PyQt6 graphical interface, ROS 2 communication, and UR3 robotic manipulation to create an interactive adaptive gaming scenario.
 
 ## Demo
 
